@@ -64,6 +64,8 @@ The CSV scanner validates batches of complete rows and indexes their field bound
 
 On the Apple M4, alternating ten warm measured runs per build on seed 76129 (10M events, 2.5M clicks) gave medians of 0.8822 s for `3e79282` and 0.8252 s for this pipeline. CPU time fell from 3.3992 s to 3.2198 s. All rows matched. A sanitizer build matched an independent CSV decoder on 210,000 generated lines across the link, click and event schemas, including malformed rows, vector boundaries and unterminated final lines.
 
+On x86 with AVX-512F, AVX-512BW and POPCNT, one 64-byte load produces the comma, quote and newline masks for each parser block. The scanner selects its instruction set once per input chunk. The AVX2, SSE2, NEON and scalar paths support the other CPU configurations. The new classifier was exercised through SIMDe on an Apple M4 against all 36 organizer fixtures, both million-event development tables and every output row of the independent 10-million-event input. The sanitizer CSV oracle also matched on 210,000 generated lines. Native AVX-512 wall time has not been measured.
+
 Generate the larger workload after `make check-dev`.
 
 ```sh

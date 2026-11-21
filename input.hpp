@@ -167,6 +167,13 @@ __attribute__((target("avx2"))) inline Separators scan64_avx2(const char* bytes)
     }
     return result;
 }
+__attribute__((target("avx512f,avx512bw"))) inline Separators scan64_avx512bw(const char* bytes) {
+    const auto input = _mm512_loadu_si512(reinterpret_cast<const void*>(bytes));
+    const std::uint64_t commas = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8(','));
+    const std::uint64_t newlines = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8('\n'));
+    const std::uint64_t quotes = _mm512_cmpeq_epi8_mask(input, _mm512_set1_epi8('"'));
+    return {commas | newlines, quotes, newlines};
+}
 #endif
 #endif
 
@@ -325,12 +332,21 @@ template <std::size_t N, typename F>
 __attribute__((target("avx2"))) void records_avx2(Text bytes, F& consume) {
     batched_records<N, scan64_avx2>(bytes, consume);
 }
+template <std::size_t N, typename F>
+__attribute__((target("avx512f,avx512bw,popcnt"))) void records_avx512bw(Text bytes, F& consume) {
+    batched_records<N, scan64_avx512bw>(bytes, consume);
+}
 #endif
 #endif
 
 template <std::size_t N, typename F> void records(Text bytes, F consume) {
 #if defined(__SSE2__) || defined(__ARM_NEON)
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx512f") && __builtin_cpu_supports("avx512bw") &&
+        __builtin_cpu_supports("popcnt")) {
+        records_avx512bw<N>(bytes, consume);
+        return;
+    }
     if (__builtin_cpu_supports("avx2")) {
         records_avx2<N>(bytes, consume);
         return;
