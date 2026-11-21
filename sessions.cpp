@@ -45,6 +45,7 @@ template <typename T, std::size_t bins = shards> struct Partition {
 struct People {
     struct Entry { Name name, owner; };
     std::vector<Entry> entries;
+    std::vector<std::uint64_t> membership;
     NamePool storage;
 
     std::size_t slot(Name name) const {
@@ -93,9 +94,27 @@ struct People {
             sizes[a] += sizes[b];
             if (labels[b] < labels[a]) { labels[a] = labels[b]; canonical[a] = canonical[b]; }
         });
-        for (auto& e : entries) if (!e.name.empty()) e.owner = canonical[root(e.owner.value)];
+        // Canonical IDs already resolve to themselves. Keep only real aliases
+        // in the read-only index and record which hash buckets can contain one.
+        std::size_t aliases = 0;
+        for (auto& e : entries) if (!e.name.empty()) {
+            e.owner = canonical[root(e.owner.value)];
+            aliases += e.name != e.owner;
+        }
+        auto previous = std::move(entries);
+        capacity = 16;
+        while (capacity * 6 / 10 < aliases) capacity *= 2;
+        entries.resize(capacity);
+        membership.resize(std::max<std::size_t>(1,capacity / 8));
+        for (const auto& e : previous) if (!e.name.empty() && e.name != e.owner) {
+            entries[slot(e.name)] = e;
+            auto h = e.name.hash();
+            membership[(h >> 6) & (membership.size() - 1)] |= UINT64_C(1) << (h & 63);
+        }
     }
     Name find(Name name) const {
+        auto h = name.hash();
+        if (!(membership[(h >> 6) & (membership.size() - 1)] & (UINT64_C(1) << (h & 63)))) return name;
         const auto& e = entries[slot(name)];
         return e.name.empty() ? name : e.owner;
     }
@@ -404,7 +423,8 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
     std::vector<int> slots(capacity, -1);
     auto locate = [&](Name person) {
         auto mask = slots.size() - 1;
-        auto pos = person.hash() & mask;
+        // The lower bits already selected this shard.
+        auto pos = (person.hash() / shards) & mask;
         while (slots[pos] != -1 && people[slots[pos]].person != person) pos = (pos + 1) & mask;
         return pos;
     };

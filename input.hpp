@@ -164,38 +164,24 @@ __attribute__((target("avx2"))) inline Separators scan64_avx2(const char* bytes)
     return result;
 }
 #endif
-
-inline unsigned quote_count(std::uint64_t bits) {
-#if defined(__x86_64__) && !defined(__POPCNT__)
-    // Generic x86 can otherwise enter a software population-count routine once
-    // per field. The CSV grammar distinguishes zero, one, two, and three or more.
-    if (!bits) return 0;
-    const auto rest = bits & (bits - 1);
-    return 1 + (rest != 0) + ((rest & (rest - 1)) != 0);
-#else
-    return __builtin_popcountll(bits);
-#endif
-}
-
 #endif
 
-// Fields can be quoted, but the input contract forbids embedded delimiters.
-// One vector pass locates field boundaries and validates quote placement.
-template <std::size_t N, typename F> void records(Text bytes, F consume) {
+// Scan an entire chunk with one instruction set so the separator finder can
+// inline into the loop. Callers dispatch once per chunk.
 #if defined(__SSE2__) || defined(__ARM_NEON)
+template <std::size_t N, auto scan_block, typename F>
+__attribute__((always_inline)) inline void vector_records(Text bytes, F& consume) {
     std::array<Text, N> row;
     auto first = bytes.data();
-    std::size_t column = 0, quotes = 0;
+    std::size_t column = 0;
     bool valid = true;
     auto field = [&](const char* last, bool newline) {
         if (column < N) {
-            Text value(first, last - first);
-            if (quotes) {
-                if (quotes == 2 && value.size() >= 2 && value.front() == '"' && value.back() == '"')
-                    value = value.substr(1, value.size() - 2);
-                else valid = false;
-            }
-            row[column] = value;
+            const auto size = last - first;
+            const bool opening = size && *first == '"';
+            const bool closing = size && last[-1] == '"';
+            if (opening != closing || (opening && size < 2)) valid = false;
+            else row[column] = Text(first + opening, size - 2 * opening);
         }
         ++column;
         if (newline) {
@@ -203,13 +189,7 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
             valid = true;
             column = 0;
         }
-        quotes = 0;
     };
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    const auto scan_block = __builtin_cpu_supports("avx2") ? &scan64_avx2 : &scan64;
-#else
-    constexpr auto scan_block = &scan64;
-#endif
     const char* block = bytes.data();
     std::size_t remaining = bytes.size();
     while (remaining) {
@@ -218,21 +198,49 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
         const char* scan = block;
         if (n < 64) { std::memcpy(tail, block, n); scan = tail; }
         auto marks = scan_block(scan);
+        auto boundary = [](char c) { return c == ',' || c == '\n'; };
+        const bool prior_end = block == bytes.data() || boundary(block[-1]);
+        const bool next_end = n == remaining || boundary(block[n]);
+        // Quotes can only occur at a field edge. Carry both separators across
+        // block boundaries and reject interior quotes in their own row.
+        const auto beside = (marks.endings << 1) | std::uint64_t(prior_end)
+                          | (marks.endings >> 1) | (std::uint64_t(next_end) << (n - 1));
+        auto interior = marks.quotes & ~beside;
         while (marks.endings) {
-            const unsigned bit = __builtin_ctzll(marks.endings);
-            const auto before = (marks.endings & -marks.endings) - 1;
-            quotes += quote_count(marks.quotes & before);
-            marks.quotes &= ~before;
+            const auto bit = __builtin_ctzll(marks.endings);
             const auto* end = block + bit;
+            if (interior) {
+                const auto before = (marks.endings & -marks.endings) - 1;
+                if (interior & before) valid = false;
+                interior &= ~before;
+            }
             field(end, *end == '\n');
             first = end + 1;
             marks.endings &= marks.endings - 1;
         }
-        quotes += quote_count(marks.quotes);
+        if (interior) valid = false;
         block += n;
         remaining -= n;
     }
     if (first != block || column) field(block, true);
+}
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+template <std::size_t N, typename F>
+__attribute__((target("avx2"))) void records_avx2(Text bytes, F& consume) {
+    vector_records<N, scan64_avx2>(bytes, consume);
+}
+#endif
+#endif
+
+template <std::size_t N, typename F> void records(Text bytes, F consume) {
+#if defined(__SSE2__) || defined(__ARM_NEON)
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    if (__builtin_cpu_supports("avx2")) {
+        records_avx2<N>(bytes, consume);
+        return;
+    }
+#endif
+    vector_records<N, scan64>(bytes, consume);
 #else
     each_line(bytes, [&](Text line) {
         std::array<Text, N> row;
