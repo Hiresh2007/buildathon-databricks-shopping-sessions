@@ -5,8 +5,10 @@
 #include <deque>
 #include <functional>
 
-// Nine ASCII characters fit losslessly in 63 bits. Other identifiers keep a view
-// of their exact CSV bytes. The choice depends solely on the identifier itself.
+// Eight ASCII bytes occupy the low seven bits of each byte in a word. For
+// nine-byte names, the leading character occupies the seven spare high bits.
+// A zero prefix denotes an eight-byte name; nine-byte names beginning with NUL
+// and all other unrepresentable names retain a view of their original bytes.
 struct Name {
     static constexpr std::uint64_t external = UINT64_C(1) << 63;
     std::uint64_t value = external;
@@ -18,17 +20,26 @@ struct Name {
         return (value & b.value & external) && !empty() && !b.empty() && reference() == b.reference();
     }
     bool operator!=(Name b) const { return !(*this == b); }
+    static constexpr std::uint64_t ascii = UINT64_C(0x7f7f7f7f7f7f7f7f);
+    // Gather the seven high bits into the low end of the result.
+    static unsigned leading(std::uint64_t bits) {
+        return ((bits & ~ascii) * UINT64_C(0x0002040810204081)) >> 56;
+    }
     Text view(std::array<char, 9>& storage) const {
         if (value & external) return reference();
-        for (int i = 0; i < 9; ++i) storage[i] = (value >> (7 * i)) & 127;
-        return Text(storage.data(), storage.size());
+        const auto first = leading(value);
+        auto body = value & ascii;
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        body = __builtin_bswap64(body);
+#endif
+        storage[0] = static_cast<char>(first);
+        std::memcpy(storage.data() + 1, &body, 8);
+        return first ? Text(storage.data(), 9) : Text(storage.data() + 1, 8);
     }
     bool operator>(Name other) const {
         if (value == other.value) return false;
-        if (!((value | other.value) & external)) {
-            const auto shift = __builtin_ctzll(value ^ other.value) / 7 * 7;
-            return ((value >> shift) & 127) > ((other.value >> shift) & 127);
-        }
+        if (!((value | other.value) & external) && !((value ^ other.value) & ~ascii))
+            return __builtin_bswap64(value & ascii) > __builtin_bswap64(other.value & ascii);
         std::array<char, 9> a, b;
         return view(a) > other.view(b);
     }
@@ -44,19 +55,23 @@ struct NameHash { std::size_t operator()(Name name) const { return name.hash(); 
 struct NamePool {
     std::deque<Text> external_names;
     Name get(Text text) {
-        if (text.size() == 9) {
-            std::uint64_t x;
-            std::memcpy(&x, text.data(), 8);
+        if (text.size() == 9 || text.size() == 8) {
+            static constexpr auto prefixes = [] {
+                std::array<std::uint64_t, 128> table{};
+                for (unsigned c = 1; c < table.size(); ++c)
+                    for (unsigned bit = 0; bit < 7; ++bit)
+                        table[c] |= std::uint64_t((c >> bit) & 1) << (8 * bit + 7);
+                return table;
+            }();
+            const bool has_prefix = text.size() == 9;
+            const auto first = has_prefix ? static_cast<unsigned char>(text[0]) : 0;
+            std::uint64_t bytes;
+            std::memcpy(&bytes, text.data() + has_prefix, 8);
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
-            x = __builtin_bswap64(x);
+            bytes = __builtin_bswap64(bytes);
 #endif
-            auto tail = static_cast<unsigned char>(text[8]);
-            if (!(x & UINT64_C(0x8080808080808080)) && tail < 128) {
-                x = (x & UINT64_C(0x007f007f007f007f)) | ((x >> 1) & UINT64_C(0x3f803f803f803f80));
-                x = (x & UINT64_C(0x00003fff00003fff)) | ((x >> 2) & UINT64_C(0x0fffc0000fffc000));
-                x = (x & UINT64_C(0x000000000fffffff)) | ((x >> 4) & UINT64_C(0x00fffffff0000000));
-                return {x | (std::uint64_t(tail) << 56)};
-            }
+            if (!(bytes & ~Name::ascii) && first < 128 && (first || !has_prefix))
+                return {bytes | prefixes[first]};
         }
         external_names.push_back(text);
         return {Name::external | reinterpret_cast<std::uintptr_t>(&external_names.back())};
