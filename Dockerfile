@@ -1,14 +1,16 @@
-FROM gcc:12-bookworm AS build
-WORKDIR /src
-COPY sessions.cpp input.hpp ./
-RUN g++ -std=c++17 -O3 -pthread -static-libstdc++ -static-libgcc sessions.cpp -o /sessions
+FROM python:3.12-slim-bookworm AS runtime
+RUN pip install --no-cache-dir --no-deps pyarrow==19.0.1
 
-FROM python:3.12-slim-bookworm
+FROM runtime AS build
+RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY sessions.cpp input.hpp identity.hpp parquet_output.hpp build.py ./
+RUN python build.py
+
+FROM runtime
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY --from=build /sessions .
+COPY --from=build /src/sessions .
 COPY run.py .
-ENV PYTHONDONTWRITEBYTECODE=1 SCRATCH_DIR=/scratch
+ENV PYTHONDONTWRITEBYTECODE=1
 USER 1000:1000
 CMD ["python", "/app/run.py"]

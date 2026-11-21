@@ -1,4 +1,4 @@
-#include "input.hpp"
+#include "parquet_output.hpp"
 #include <atomic>
 #include <fstream>
 #include <iostream>
@@ -28,6 +28,10 @@ template <typename F> void parallel(std::size_t jobs, F work) {
 // Writers own separate partitions. Readers can merge and release each shard independently.
 template <typename T> struct Partition {
     std::vector<std::array<std::vector<T>, shards>> local{threads};
+    void reserve_rows(std::size_t rows) {
+        const auto per_bucket = std::min<std::size_t>(131072, rows / (local.size() * shards));
+        for (auto& worker : local) for (auto& bucket : worker) bucket.reserve(per_bucket);
+    }
     void add(std::size_t thread, std::size_t hash, T row) {
         local[thread][hash % shards].push_back(row);
     }
@@ -44,62 +48,62 @@ template <typename T> struct Partition {
     }
 };
 
-struct Components {
-    Names index;
-    std::vector<int> parent, sizes;
-    std::vector<Text> canonical;
-    int id(Text name) {
-        auto [it, fresh] = index.try_emplace(name, static_cast<int>(parent.size()));
-        if (fresh) {
-            parent.push_back(it->second);
-            sizes.push_back(1);
-            canonical.push_back(name);
-        }
-        return it->second;
-    }
-    int root(int x) {
-        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
-        return x;
-    }
-    void join(Text x, Text y) {
-        auto a = root(id(x)), b = root(id(y));
-        if (a == b) return;
-        if (sizes[a] < sizes[b]) std::swap(a, b);
-        parent[b] = a;
-        sizes[a] += sizes[b];
-        canonical[a] = std::min(canonical[a], canonical[b]);
-    }
-};
-
 struct People {
-    struct Entry { Text name, canonical; };
-    std::vector<Entry> lookup;
+    struct Entry { Name name, owner; };
+    std::vector<Entry> entries;
+    NamePool storage;
+
+    std::size_t slot(Name name) const {
+        const auto mask = entries.size() - 1;
+        auto i = name.hash() & mask;
+        while (!entries[i].name.empty() && entries[i].name != name) i = (i + 1) & mask;
+        return i;
+    }
     explicit People(const Files& links) {
-        Components components;
-        std::size_t bytes = 0;
+        std::size_t bytes = 0, capacity = 16;
         for (auto chunk : links.chunks) bytes += chunk.size();
-        components.index.reserve(bytes / 20);
+        while (capacity < bytes / 10) capacity *= 2;
+        entries.resize(capacity);
+        std::vector<int> parent, sizes;
+        std::vector<Name> canonical;
+        std::vector<Text> labels;
+        auto id = [&](Text text) {
+            Name name = storage.get(text);
+            auto i = slot(name);
+            if (entries[i].name.empty()) {
+                if (parent.size() * 10 >= entries.size() * 7) {
+                    auto previous = std::move(entries);
+                    entries.resize(previous.size() * 2);
+                    for (auto e : previous) if (!e.name.empty()) entries[slot(e.name)] = e;
+                    i = slot(name);
+                }
+                entries[i] = {name, {parent.size()}};
+                parent.push_back(static_cast<int>(parent.size()));
+                sizes.push_back(1);
+                canonical.push_back(name);
+                labels.push_back(text);
+            }
+            return static_cast<int>(entries[i].owner.value);
+        };
+        auto root = [&](int i) {
+            while (parent[i] != i) {parent[i] = parent[parent[i]]; i = parent[i];}
+            return i;
+        };
         for (auto chunk : links.chunks) each_line(chunk, [&](Text line) {
             std::array<Text, 2> f;
-            if (fields(line, f) && !f[0].empty() && !f[1].empty()) components.join(f[0], f[1]);
+            if (!fields(line, f) || f[0].empty() || f[1].empty()) return;
+            auto a = root(id(f[0])), b = root(id(f[1]));
+            if (a == b) return;
+            if (sizes[a] < sizes[b]) std::swap(a, b);
+            parent[b] = a;
+            sizes[a] += sizes[b];
+            if (labels[b] < labels[a]) { labels[a] = labels[b]; canonical[a] = canonical[b]; }
         });
-        std::size_t capacity = 1;
-        while (capacity < components.index.size() * 2) capacity *= 2;
-        lookup.resize(capacity);
-        for (const auto& [name, i] : components.index) {
-            auto slot = std::hash<Text>{}(name) & (capacity - 1);
-            while (!lookup[slot].name.empty()) slot = (slot + 1) & (capacity - 1);
-            lookup[slot] = {name, components.canonical[components.root(i)]};
-        }
+        for (auto& e : entries) if (!e.name.empty()) e.owner = canonical[root(e.owner.value)];
     }
-    Text find(Text name) const {
-        auto mask = lookup.size() - 1;
-        auto slot = std::hash<Text>{}(name) & mask;
-        while (!lookup[slot].name.empty()) {
-            if (lookup[slot].name == name) return lookup[slot].canonical;
-            slot = (slot + 1) & mask;
-        }
-        return name;
+    Name find(Name name) const {
+        const auto& e = entries[slot(name)];
+        return e.name.empty() ? name : e.owner;
     }
 };
 
@@ -125,12 +129,12 @@ struct Catalog {
     }
 };
 
-struct Event { Text person; Millis ts; int price, category; };
-struct Click { Text person, id; Millis ts; int campaign; };
-struct Version { Text id; std::size_t hash; Millis ingest; Event event; };
+struct Event { Name person; Millis ts; int price, category; };
+struct Click { Name person; Text id; Millis ts; int campaign; };
+struct Version { Name id; Millis ingest; Event event; };
 
 Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, Millis end,
-                     const People& people, const Catalog& catalog) {
+                     const People& people, const Catalog& catalog, NamePool& names) {
     if (f[1].empty() || f[5].empty()) return {};
     const auto ts = timestamp(f[2]);
     if (ts < start || ts >= end || ingest - ts > day_ms) return {};
@@ -141,23 +145,26 @@ Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, 
         auto product = catalog.products.find(f[5]);
         if (product != catalog.products.end()) category = product->second;
     } else if (f[4] != "view" && f[4] != "cart") return {};
-    return {people.find(f[1]), ts, price, category};
+    return {people.find(names.get(f[1])), ts, price, category};
 }
 
 void load_events(const Files& files, const People& people, const Catalog& catalog,
-                 Millis start, Millis end, Partition<Event>& out) {
+                 Millis start, Millis end, Partition<Event>& out, std::vector<NamePool>& names) {
     Partition<Version> versions;
+    versions.reserve_rows(files.estimated_rows());
+    std::vector<NamePool> ids(threads);
     parallel(files.chunks.size(), [&](auto t, auto j) {
-        each_line(files.chunks[j], [&](Text line) {
-            std::array<Text, 7> f;
-            if (!fields(line, f) || f[0].empty()) return;
-            auto hash = std::hash<Text>{}(f[0]);
+        records<7>(files.chunks[j], [&](const auto& f) {
+            if (f[0].empty()) return;
+            auto id = ids[t].get(f[0]);
+            auto hash = id.hash();
             auto ingest = ingest_time(f[3]);
             if (ingest == invalid_time) return;
             // Retain the earliest version even when its payload fails validation.
-            versions.add(t, hash, {f[0], hash, ingest, validate_event(f, ingest, start, end, people, catalog)});
+            versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, people, catalog, names[t])});
         });
     });
+    out.reserve_rows(files.estimated_rows());
     parallel(shards, [&](auto t, auto shard) {
         std::size_t count = 0, capacity = 1;
         for (const auto& worker : versions.local) count += worker[shard].size();
@@ -166,32 +173,32 @@ void load_events(const Files& files, const People& people, const Catalog& catalo
         for (const auto& worker : versions.local) {
             for (const auto& row : worker[shard]) {
                 // Low hash bits already selected the shard. Probe with the remaining bits.
-                auto slot = (row.hash / shards) & (capacity - 1);
-                while (slots[slot] && (slots[slot]->hash != row.hash || slots[slot]->id != row.id))
+                auto slot = (row.id.hash() / shards) & (capacity - 1);
+                while (slots[slot] && slots[slot]->id != row.id)
                     slot = (slot + 1) & (capacity - 1);
                 if (!slots[slot] || row.ingest < slots[slot]->ingest) slots[slot] = &row;
             }
         }
         for (auto row : slots) {
             if (row && !row->event.person.empty())
-                out.add(t, std::hash<Text>{}(row->event.person), row->event);
+                out.add(t, row->event.person.hash(), row->event);
         }
         for (auto& worker : versions.local) std::vector<Version>().swap(worker[shard]);
     });
 }
 
 void load_clicks(const Files& files, const People& people, const Catalog& catalog,
-                 Millis start, Millis end, Partition<Click>& out) {
+                 Millis start, Millis end, Partition<Click>& out, std::vector<NamePool>& names) {
+    out.reserve_rows(files.estimated_rows());
     parallel(files.chunks.size(), [&](auto t, auto j) {
-        each_line(files.chunks[j], [&](Text line) {
-            std::array<Text, 4> f;
-            if (!fields(line, f) || f[0].empty() || f[1].empty()) return;
+        records<4>(files.chunks[j], [&](const auto& f) {
+            if (f[0].empty() || f[1].empty()) return;
             auto ts = timestamp(f[3]);
             if (ts < start - week_ms || ts >= end) return;
             auto campaign = catalog.campaigns.find(f[2]);
             if (campaign == catalog.campaigns.end()) return;
-            auto person = people.find(f[1]);
-            out.add(t, std::hash<Text>{}(person), {person, f[0], ts, campaign->second});
+            auto person = people.find(names[t].get(f[1]));
+            out.add(t, person.hash(), {person, f[0], ts, campaign->second});
         });
     });
 }
@@ -214,22 +221,43 @@ struct CampaignDayHash {
         return static_cast<std::size_t>(static_cast<unsigned>(key.day)) * 0x9e3779b1U + static_cast<unsigned>(key.id);
     }
 };
-using CampaignTotals = std::unordered_map<CampaignDay, Totals, CampaignDayHash>;
+using SparseTotals = std::unordered_map<CampaignDay, Totals, CampaignDayHash>;
 
-// Source strings cannot contain double quotes. Quoting preserves empty strings, spaces and CR.
-void quoted(std::ostream& stream, Text text) { stream << '"' << text << '"'; }
+struct CampaignTotals {
+    int first_day;
+    std::size_t campaigns;
+    std::vector<Totals> dense;
+    SparseTotals sparse;
+    CampaignTotals(int first, int last, std::size_t n) : first_day(first), campaigns(n) {
+        auto length = std::int64_t(last) - first + 1;
+        if (length > 0 && std::uint64_t(length) <= 500000 / n) dense.resize(n * length);
+    }
+    Totals& get(int id, int day) {
+        if (dense.empty()) return sparse[{id, day}];
+        return dense[std::size_t(day - first_day) * campaigns + id];
+    }
+    void merge_into(SparseTotals& combined) const {
+        for (const auto& [key, value] : sparse) combined[key].add(value);
+        for (std::size_t i = 0; i < dense.size(); ++i) {
+            if (dense[i].sessions || dense[i].assists)
+                combined[{int(i % campaigns), first_day + int(i / campaigns)}].add(dense[i]);
+        }
+    }
+};
 
 void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Catalog& catalog,
-               CampaignTotals& totals, std::ostream& users) {
+               CampaignTotals& totals, UserRows& users) {
     struct TimedEvent { Millis ts; int price, category; };
     struct TimedClick { Millis ts; Text id; int campaign; };
     struct Activity {
-        Text person;
+        Name person;
         std::vector<TimedEvent> events;
         std::vector<TimedClick> clicks;
     };
     std::vector<Activity> people;
-    std::unordered_map<Text, std::size_t> positions;
+    std::unordered_map<Name, std::size_t, NameHash> positions;
+    positions.reserve(events.size() / 16);
+    people.reserve(events.size() / 16);
     for (const auto& e : events) {
         auto [pos, fresh] = positions.try_emplace(e.person, people.size());
         if (fresh) people.push_back({e.person, {}, {}});
@@ -241,8 +269,10 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
         if (pos != positions.end()) people[pos->second].clicks.push_back({c.ts, c.id, c.campaign});
     }
     std::vector<Click>().swap(clicks);
+    std::vector<int> click_counts(catalog.campaign_ids.size()), positions_in_window(click_counts.size());
+    std::vector<int> active, purchased;
+    std::vector<std::int64_t> category_revenue(catalog.categories.size());
     for (auto& activity : people) {
-        auto person = activity.person;
         auto& events = activity.events;
         auto& clicks = activity.clicks;
         std::sort(events.begin(), events.end(), [](const TimedEvent& a, const TimedEvent& b) { return a.ts < b.ts; });
@@ -250,22 +280,22 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
             return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
         });
         std::size_t ei = 0, left = 0, right = 0;
-        std::unordered_map<int, int> active;
         int user_day = 0, sessions = 0;
         std::int64_t daily_events = 0, daily_revenue = 0;
-        std::unordered_map<int, std::int64_t> category_revenue;
         auto write_day = [&] {
-            quoted(users, person);
-            users << ',' << user_day << ',' << sessions << ',' << daily_events << ',' << daily_revenue << ',';
             int best = -1;
             std::int64_t best_revenue = -1;
-            for (auto [id, revenue] : category_revenue)
-                if (revenue > best_revenue || (revenue == best_revenue && catalog.categories[id] < catalog.categories[best])) {
+            for (int id : purchased) {
+                auto cents = category_revenue[id];
+                if (cents > best_revenue || (cents == best_revenue && catalog.categories[id] < catalog.categories[best])) {
                     best = id;
-                    best_revenue = revenue;
+                    best_revenue = cents;
                 }
-            if (best != -1) quoted(users, catalog.categories[best]);
-            users << '\n';
+                category_revenue[id] = 0;
+            }
+            purchased.clear();
+            users.append(activity.person, user_day, sessions, daily_events, daily_revenue,
+                         best < 0 ? nullptr : &catalog.categories[best]);
         };
         while (ei < events.size()) {
             Millis start = events[ei].ts;
@@ -274,7 +304,6 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
                 write_day();
                 sessions = 0;
                 daily_events = daily_revenue = 0;
-                category_revenue.clear();
             }
             user_day = day;
             ++sessions;
@@ -284,6 +313,7 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
                 const auto& event = events[ei++];
                 if (event.price) {
                     revenue += event.price;
+                    if (!category_revenue[event.category]) purchased.push_back(event.category);
                     category_revenue[event.category] += event.price;
                 }
             } while (ei < events.size() && events[ei].ts - events[ei - 1].ts <= session_gap);
@@ -291,30 +321,42 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
             daily_revenue += revenue;
             // Identical duplicate clicks enter and leave together. Only distinct campaigns
             // and the identity of the final click affect either output.
-            while (right < clicks.size() && clicks[right].ts <= start)
-                ++active[clicks[right++].campaign];
+            while (right < clicks.size() && clicks[right].ts <= start) {
+                int id = clicks[right++].campaign;
+                if (click_counts[id]++ == 0) {
+                    positions_in_window[id] = active.size();
+                    active.push_back(id);
+                }
+            }
             while (left < right && clicks[left].ts < start - week_ms) {
                 int campaign = clicks[left++].campaign;
-                if (!--active[campaign]) active.erase(campaign);
+                if (!--click_counts[campaign]) {
+                    int pos = positions_in_window[campaign];
+                    active[pos] = active.back();
+                    positions_in_window[active[pos]] = pos;
+                    active.pop_back();
+                }
             }
             int credited = left == right ? 0 : clicks[right - 1].campaign;
-            auto& metrics = totals[{credited, day}];
+            auto& metrics = totals.get(credited, day);
             ++metrics.sessions;
             metrics.revenue += revenue;
             metrics.purchasing += revenue > 0;
-            for (auto [campaign, count] : active) ++totals[{campaign, day}].assists;
+            for (int campaign : active) ++totals.get(campaign, day).assists;
         }
         write_day();
+        for (int campaign : active) click_counts[campaign] = 0;
+        active.clear();
     }
 }
 
 int main(int argc, char** argv) {
     if (argc != 6) {
-        std::cerr << "usage: sessions DATA SCRATCH WINDOW_START_MS WINDOW_END_MS THREADS\n";
+        std::cerr << "usage: sessions DATA OUTPUT WINDOW_START_MS WINDOW_END_MS THREADS\n";
         return 2;
     }
     try {
-        fs::path data = argv[1], scratch = argv[2];
+        fs::path data = argv[1], output = argv[2];
         Millis start = std::stoll(argv[3]), end = std::stoll(argv[4]);
         threads = std::clamp(std::stoi(argv[5]), 1, 8);
         Files links(data / "links"), products(data / "products.csv"), campaigns(data / "campaigns.csv");
@@ -323,35 +365,61 @@ int main(int argc, char** argv) {
         Catalog catalog(products, campaigns);
         Partition<Event> events;
         Partition<Click> clicks;
-        load_events(event_files, people, catalog, start, end, events);
-        load_clicks(click_files, people, catalog, start, end, clicks);
-        std::vector<CampaignTotals> totals(threads);
-        std::vector<std::ofstream> users;
-        for (std::size_t t = 0; t < threads; ++t) {
-            users.emplace_back(scratch / ("user-" + std::to_string(t) + ".csv"));
-            users.back().exceptions(std::ios::failbit | std::ios::badbit);
-            users.back() << "user_id,day,sessions,events,revenue_cents,top_category\n";
+        std::vector<NamePool> names(threads);
+        load_events(event_files, people, catalog, start, end, events, names);
+        load_clicks(click_files, people, catalog, start, end, clicks, names);
+        auto day_of = [](Millis ts) { return int(ts / day_ms - (ts % day_ms < 0)); };
+        std::vector<CampaignTotals> totals;
+        for (std::size_t t = 0; t < threads; ++t)
+            totals.emplace_back(day_of(start), day_of(end), catalog.campaign_ids.size());
+        fs::create_directories(output / "user_daily");
+        fs::create_directories(output / "campaign_daily");
+        std::vector<UserRows> users;
+        for (std::size_t t = 0; t < threads; ++t)
+            users.emplace_back(output / "user_daily" / ("part-" + std::to_string(t) + ".parquet"));
+        for (std::size_t t = threads; t < 8; ++t)
+            fs::remove(output / "user_daily" / ("part-" + std::to_string(t) + ".parquet"));
+        std::array<std::pair<std::size_t, std::size_t>, shards> order{};
+        for (std::size_t shard = 0; shard < shards; ++shard) {
+            order[shard].second = shard;
+            for (const auto& worker : events.local) order[shard].first += worker[shard].size();
+            for (const auto& worker : clicks.local) order[shard].first += worker[shard].size();
         }
-        parallel(shards, [&](auto t, auto shard) {
+        std::sort(order.rbegin(), order.rend());
+        parallel(shards, [&](auto t, auto job) {
+            auto shard = order[job].second;
             auto e = events.take(shard);
             auto c = clicks.take(shard);
             aggregate(e, c, catalog, totals[t], users[t]);
         });
         for (auto& stream : users) stream.close();
-        CampaignTotals combined;
-        for (const auto& local : totals) for (const auto& [key, metrics] : local) combined[key].add(metrics);
-        std::ofstream output(scratch / "campaign.csv");
-        output.exceptions(std::ios::failbit | std::ios::badbit);
-        output << "campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n";
-        for (auto& [key, metrics] : combined) {
-            auto [id, day] = key;
-            quoted(output, catalog.campaign_ids[id]);
-            output << ',';
-            quoted(output, catalog.channels[id]);
-            output << ',' << day << ',' << metrics.sessions << ',' << metrics.purchasing << ','
-                   << metrics.revenue << ',' << metrics.assists << '\n';
+        SparseTotals combined;
+        for (const auto& local : totals) local.merge_into(combined);
+        auto campaign_file = parquet_file(output / "campaign_daily" / "part-0.parquet", {
+            column("campaign_id", pq::Type::BYTE_ARRAY, pq::ConvertedType::UTF8),
+            column("channel", pq::Type::BYTE_ARRAY, pq::ConvertedType::UTF8),
+            column("day", pq::Type::INT32, pq::ConvertedType::DATE), column("sessions", pq::Type::INT64),
+            column("purchasing_sessions", pq::Type::INT64), column("revenue_cents", pq::Type::INT64),
+            column("assisted_sessions", pq::Type::INT64)});
+        if (!combined.empty()) {
+            auto group = campaign_file->AppendRowGroup();
+            std::vector<pq::ByteArray> ids, channels;
+            std::vector<std::int32_t> days;
+            std::vector<std::int64_t> counts, purchasing, revenue, assists;
+            for (const auto& [key, metrics] : combined) {
+                ids.push_back(binary(catalog.campaign_ids[key.id]));
+                channels.push_back(binary(catalog.channels[key.id]));
+                days.push_back(key.day); counts.push_back(metrics.sessions);
+                purchasing.push_back(metrics.purchasing); revenue.push_back(metrics.revenue);
+                assists.push_back(metrics.assists);
+            }
+            put_column<pq::ByteArrayWriter>(group, ids); put_column<pq::ByteArrayWriter>(group, channels);
+            put_column<pq::Int32Writer>(group, days); put_column<pq::Int64Writer>(group, counts);
+            put_column<pq::Int64Writer>(group, purchasing); put_column<pq::Int64Writer>(group, revenue);
+            put_column<pq::Int64Writer>(group, assists);
+            group->Close();
         }
-        output.close();
+        campaign_file->Close();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

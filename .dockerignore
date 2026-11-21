@@ -4,3 +4,6 @@
 !input.hpp
 !requirements.txt
 !run.py
+!identity.hpp
+!parquet_output.hpp
+!build.py

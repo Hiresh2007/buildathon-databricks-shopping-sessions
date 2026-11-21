@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The native C++17 stage memory-maps the inputs, connects IDs with union-find, resolves event versions by earliest ingestion time, and sorts each person's events and clicks. A moving seven-day window tracks each assisting campaign and the click that receives credit. Polars writes the final tables with Parquet dates and nullable purchase categories. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps nine-byte ASCII identifiers in one machine word. Other identifiers retain their full source bytes. Each worker sorts its users’ events and clicks, tracks the seven-day attribution window and writes typed Parquet row groups directly through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run locally
 
@@ -12,7 +12,7 @@ make check-dev
 .venv/bin/python run.py /path/to/input /path/to/output
 ```
 
-The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The runner accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. It uses `SCRATCH_DIR` for temporary files and up to eight workers from `NCPU`.
+The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The runner accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. The runner uses up to eight workers from `NCPU`. It writes directly into the two output directories.
 
 ## Run the competition image
 
@@ -32,13 +32,18 @@ Use this directory as the public repository root and submit its Git commit on th
 
 ## Validation and timing
 
-All 36 organizer fixtures passed. The public million-event development answer matched exactly across 117,038 user rows and 27,400 campaign rows. An independent Python implementation also matched both output tables for generator seed 78 with 40,000 events and 10,000 clicks.
+All 36 organizer fixtures passed. Both tables matched the public million-event answer exactly, with 117,038 user-days and 27,400 campaign-days. On a separate generator seed with 20 million events and 5 million clicks, all 2,241,647 user-days and 28,014 campaign-days matched the previous implementation, including nulls and duplicate-key checks.
 
-On an Apple M4, generator seed 42 with 6 million events and 1.5 million clicks took **0.857 seconds** locally, compared with **1.194 seconds** for the initial sorting-based implementation. These are medians of five warm end-to-end runs per version, alternating execution order. Both versions produced identical results across 685,322 user rows and 28,014 campaign rows. The official scorer times a Linux/amd64 container on hidden data.
+End-to-end times on an Apple M4 were medians of five alternating runs per version, with eight workers and warm input files. The baselines used commit `df65661`. The hosted scorer uses a Linux/amd64 container and hidden data.
 
-The following commands reproduce the six-million-event workload after `make check-dev`.
+| Generated input | Previous version | Current version |
+| --- | ---: | ---: |
+| 1M events, 250k clicks, seed 1 | 0.187 s | 0.085 s |
+| 20M events, 5M clicks, seed 71 | 2.438 s | 1.379 s |
+
+Generate the larger workload after `make check-dev`.
 
 ```sh
-.cache/generator/target/release/generate --seed 42 --events 6000000 --clicks 1500000 --output .cache/bench
+.cache/generator/target/release/generate --seed 71 --events 20000000 --clicks 5000000 --output .cache/bench
 time .venv/bin/python run.py .cache/bench .cache/bench-output
 ```
