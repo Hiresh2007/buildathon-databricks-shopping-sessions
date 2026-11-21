@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps nine-byte ASCII identifiers in one machine word. Other identifiers retain their full source bytes. Workers overlap link construction with event parsing. A singly occupied hash bucket certifies a unique event ID. Repeated buckets receive full ID and ingestion-time comparisons. Each worker groups its users’ activity in contiguous buffers, orders dense users by half-hour bins, tracks the seven-day attribution window and writes typed Parquet row groups through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps nine-byte ASCII identifiers in one machine word. Other identifiers retain their full source bytes. Workers claim link and event chunks from the same queue. Concurrent union-find always attaches the larger identity to the smaller one. Each successful merge records the child for the final alias index. A singly occupied hash bucket certifies a unique event ID. Repeated buckets receive full ID and ingestion-time comparisons. Each worker groups its users’ activity in contiguous buffers, orders dense users by half-hour bins, tracks the seven-day attribution window and writes typed Parquet row groups through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run locally
 
@@ -55,6 +55,8 @@ These end-to-end medians compare six measured pairs after one warm-up. The host 
 A separate parser check compared 168,000 generated lines against an independent implementation, including malformed quotes at vector boundaries and rows without a final newline.
 
 An independent Python implementation verified a 40,000-event case with a wide date range, more than 255 purchase categories and mixed-width Unicode identifiers. It also verified a dense-event case with exact 30-minute boundaries, day transitions and tied click times. The reader uses AVX2, SSE2 or NEON when supported, with a scalar implementation for other architectures.
+
+The parallel identity graph matched commit `2d4625f` on an independent 20-million-event, 5-million-click dataset (seed 513917). Both tables matched across 2,239,293 user-days and 28,014 campaign-days. A separate 50,000-identity chain mixed ASCII and UTF-8 names, reversed duplicate edges, and 24 input files. Its expected single session and attributed campaign matched with one, two and eight workers.
 
 Generate the larger workload after `make check-dev`.
 

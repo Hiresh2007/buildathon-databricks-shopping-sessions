@@ -42,11 +42,93 @@ template <typename T, std::size_t bins = shards> struct Partition {
     }
 };
 
+// Publish graph nodes through their keys. Parent links always point to a strictly
+// smaller name, so concurrent unions cannot form a cycle. A successful union
+// records the child once; these are precisely the aliases that need a lookup.
+struct ConnectedAliases {
+    struct Node {
+        std::atomic<std::uint64_t> key{Name::external};
+        std::atomic<int> parent{-1};
+    };
+    struct alignas(64) Reader {
+        NamePool names;
+        std::vector<int> children;
+    };
+
+    std::size_t mask;
+    std::unique_ptr<Node[]> nodes;
+    std::vector<Reader> readers{threads};
+
+    explicit ConnectedAliases(const Files& links) {
+        std::size_t rows = 0;
+        for (Text chunk : links.chunks)
+            rows += std::count(chunk.begin(), chunk.end(), '\n') + (!chunk.empty() && chunk.back() != '\n');
+
+        // At most two distinct IDs can be introduced by a row. One empty slot
+        // is sufficient to guarantee that every unsuccessful probe terminates.
+        std::size_t capacity = 16;
+        while (capacity * 19 / 20 < 2 * rows) {
+            if (capacity > static_cast<std::size_t>(INT32_MAX) / 2)
+                throw std::length_error("too many linked identities");
+            capacity *= 2;
+        }
+        mask = capacity - 1;
+        nodes = std::make_unique<Node[]>(capacity);
+    }
+
+    int intern(Name name) {
+        auto i = name.hash() & mask;
+        for (;;) {
+            auto key = nodes[i].key.load(std::memory_order_acquire);
+            if (key == Name::external && nodes[i].key.compare_exchange_strong(
+                    key, name.value, std::memory_order_acq_rel, std::memory_order_acquire))
+                return static_cast<int>(i);
+            if (Name{key} == name) return static_cast<int>(i);
+            i = (i + 1) & mask;
+        }
+    }
+
+    int root(int i) const {
+        for (;;) {
+            auto parent = nodes[i].parent.load(std::memory_order_acquire);
+            if (parent < 0) return i;
+            auto next = nodes[parent].parent.load(std::memory_order_acquire);
+            if (next < 0) return parent;
+            nodes[i].parent.compare_exchange_weak(parent, next, std::memory_order_release,
+                                                  std::memory_order_relaxed);
+            i = next;
+        }
+    }
+
+    Name name(int i) const { return {nodes[i].key.load(std::memory_order_acquire)}; }
+
+    void read(Text chunk, std::size_t worker) {
+        auto& reader = readers[worker];
+        records<2>(chunk, [&](const auto& row) {
+            if (row[0].empty() || row[1].empty()) return;
+            int a = intern(reader.names.get(row[0]));
+            int b = intern(reader.names.get(row[1]));
+            for (;;) {
+                a = root(a);
+                b = root(b);
+                if (a == b) return;
+                if (name(a) > name(b)) std::swap(a, b);
+                int expected = -1;
+                if (nodes[b].parent.compare_exchange_weak(expected, a, std::memory_order_release,
+                                                          std::memory_order_relaxed)) {
+                    reader.children.push_back(b);
+                    return;
+                }
+            }
+        });
+    }
+};
+
 struct People {
     struct Entry { Name name, owner; };
     std::vector<Entry> entries;
     std::vector<std::uint64_t> membership;
-    NamePool storage;
+    std::vector<NamePool> storage;
 
     std::size_t slot(Name name) const {
         const auto mask = entries.size() - 1;
@@ -54,64 +136,25 @@ struct People {
         while (!entries[i].name.empty() && entries[i].name != name) i = (i + 1) & mask;
         return i;
     }
-    explicit People(const Files& links) {
-        std::size_t bytes = 0, capacity = 16;
-        for (auto chunk : links.chunks) bytes += chunk.size();
-        while (capacity < bytes / 10) capacity *= 2;
-        entries.resize(capacity);
-        std::vector<int> parent, sizes;
-        std::vector<Name> canonical;
-        std::vector<Text> labels;
-        auto id = [&](Text text) {
-            Name name = storage.get(text);
-            auto i = slot(name);
-            if (entries[i].name.empty()) {
-                if (parent.size() * 10 >= entries.size() * 7) {
-                    auto previous = std::move(entries);
-                    entries.resize(previous.size() * 2);
-                    for (auto e : previous) if (!e.name.empty()) entries[slot(e.name)] = e;
-                    i = slot(name);
-                }
-                entries[i] = {name, {parent.size()}};
-                parent.push_back(static_cast<int>(parent.size()));
-                sizes.push_back(1);
-                canonical.push_back(name);
-                labels.push_back(text);
-            }
-            return static_cast<int>(entries[i].owner.value);
-        };
-        auto root = [&](int i) {
-            while (parent[i] != i) {parent[i] = parent[parent[i]]; i = parent[i];}
-            return i;
-        };
-        for (auto chunk : links.chunks) each_line(chunk, [&](Text line) {
-            std::array<Text, 2> f;
-            if (!fields(line, f) || f[0].empty() || f[1].empty()) return;
-            auto a = root(id(f[0])), b = root(id(f[1]));
-            if (a == b) return;
-            if (sizes[a] < sizes[b]) std::swap(a, b);
-            parent[b] = a;
-            sizes[a] += sizes[b];
-            if (labels[b] < labels[a]) { labels[a] = labels[b]; canonical[a] = canonical[b]; }
-        });
-        // Canonical IDs already resolve to themselves. Keep only real aliases
-        // in the read-only index and record which hash buckets can contain one.
-        std::size_t aliases = 0;
-        for (auto& e : entries) if (!e.name.empty()) {
-            e.owner = canonical[root(e.owner.value)];
-            aliases += e.name != e.owner;
-        }
-        auto previous = std::move(entries);
-        capacity = 16;
+
+    explicit People(ConnectedAliases& links) {
+        std::size_t aliases = 0, capacity = 16;
+        for (const auto& reader : links.readers) aliases += reader.children.size();
         while (capacity * 6 / 10 < aliases) capacity *= 2;
         entries.resize(capacity);
-        membership.resize(std::max<std::size_t>(1,capacity / 8));
-        for (const auto& e : previous) if (!e.name.empty() && e.name != e.owner) {
-            entries[slot(e.name)] = e;
-            auto h = e.name.hash();
-            membership[(h >> 6) & (membership.size() - 1)] |= UINT64_C(1) << (h & 63);
+        membership.resize(std::max<std::size_t>(1, capacity / 8));
+        storage.reserve(links.readers.size());
+        for (auto& reader : links.readers) {
+            for (int child : reader.children) {
+                auto name = links.name(child);
+                entries[slot(name)] = {name, links.name(links.root(child))};
+                auto h = name.hash();
+                membership[(h >> 6) & (membership.size() - 1)] |= UINT64_C(1) << (h & 63);
+            }
+            storage.push_back(std::move(reader.names));
         }
     }
+
     Name find(Name name) const {
         auto h = name.hash();
         if (!(membership[(h >> 6) & (membership.size() - 1)] & (UINT64_C(1) << (h & 63)))) return name;
@@ -247,9 +290,13 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
     Partition<Version, id_shards> versions;
     versions.reserve_rows(files.estimated_rows());
     std::vector<NamePool> ids(threads);
-    parallel(files.chunks.size() + 1, [&](auto t, auto j) {
-        if (j == 0) { people.emplace(links); return; }
-        records<7>(files.chunks[j - 1], [&](const auto& f) {
+    auto graph = std::make_unique<ConnectedAliases>(links);
+    parallel(links.chunks.size() + files.chunks.size(), [&](auto t, auto j) {
+        if (j < links.chunks.size()) {
+            graph->read(links.chunks[j], t);
+            return;
+        }
+        records<7>(files.chunks[j - links.chunks.size()], [&](const auto& f) {
             if (f[0].empty()) return;
             auto id = ids[t].get(f[0]);
             auto hash = id.hash();
@@ -259,6 +306,8 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
             versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, catalog, names[t], values, t)});
         });
     });
+    people.emplace(*graph);
+    graph.reset();
     out.reserve_rows(files.estimated_rows());
     parallel(id_shards, [&](auto t, auto shard) {
         std::size_t count = 0;
