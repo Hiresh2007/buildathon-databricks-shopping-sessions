@@ -1,7 +1,7 @@
 #include "parquet_output.hpp"
 #include <atomic>
-#include <fstream>
 #include <iostream>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
@@ -26,25 +26,14 @@ template <typename F> void parallel(std::size_t jobs, F work) {
 }
 
 // Writers own separate partitions. Readers can merge and release each shard independently.
-template <typename T> struct Partition {
-    std::vector<std::array<std::vector<T>, shards>> local{threads};
+template <typename T, std::size_t bins = shards> struct Partition {
+    std::vector<std::array<std::vector<T>, bins>> local{threads};
     void reserve_rows(std::size_t rows) {
-        const auto per_bucket = std::min<std::size_t>(131072, rows / (local.size() * shards));
+        const auto per_bucket = std::min<std::size_t>(131072, rows / (local.size() * bins));
         for (auto& worker : local) for (auto& bucket : worker) bucket.reserve(per_bucket);
     }
     void add(std::size_t thread, std::size_t hash, T row) {
-        local[thread][hash % shards].push_back(row);
-    }
-    std::vector<T> take(std::size_t shard) {
-        std::size_t count = 0;
-        for (const auto& w : local) count += w[shard].size();
-        std::vector<T> result;
-        result.reserve(count);
-        for (auto& w : local) {
-            result.insert(result.end(), w[shard].begin(), w[shard].end());
-            std::vector<T>().swap(w[shard]);
-        }
-        return result;
+        local[thread][hash % bins].push_back(row);
     }
 };
 
@@ -107,8 +96,47 @@ struct People {
     }
 };
 
+struct CatalogIndex {
+    struct Entry { Text key; int value = -1; };
+    Names fallback;
+    Text prefix;
+    std::vector<Entry> dense;
+
+    void compact() {
+        if (fallback.empty()) return;
+        auto sample = fallback.begin()->first;
+        auto cut = sample.size();
+        while (cut && sample[cut-1] >= '0' && sample[cut-1] <= '9') --cut;
+        if (cut == sample.size()) return;
+        prefix = sample.substr(0, cut);
+        std::size_t limit = std::min<std::size_t>(fallback.size()*4, 4000000), largest = 0;
+        for (const auto& [key, value] : fallback) {
+            if (key.size() <= cut || key.substr(0, cut) != prefix) return;
+            auto i = number(key.substr(cut), limit);
+            if (i < 0) return;
+            largest = std::max(largest, std::size_t(i));
+        }
+        dense.resize(largest + 1);
+        for (const auto& [key, value] : fallback) {
+            auto& entry = dense[number(key.substr(cut), limit)];
+            if (entry.value != -1) { dense.clear(); return; }
+            entry = {key, value};
+        }
+        Names().swap(fallback);
+    }
+    int find(Text key) const {
+        if (!dense.empty()) {
+            if (key.size() <= prefix.size()) return -1;
+            const auto i = number(key.substr(prefix.size()), dense.size()-1);
+            return i < 0 || dense[i].key != key ? -1 : dense[i].value;
+        }
+        auto it = fallback.find(key);
+        return it == fallback.end() ? -1 : it->second;
+    }
+};
+
 struct Catalog {
-    Names products, campaigns;
+    CatalogIndex products, campaigns;
     std::vector<Text> categories{"unknown"}, campaign_ids{"organic"}, channels{"organic"};
     Catalog(const Files& product_files, const Files& campaign_files) {
         Names category_index{{"unknown", 0}};
@@ -117,24 +145,65 @@ struct Catalog {
             if (!fields(line, f)) return;
             auto [category, fresh] = category_index.try_emplace(f[1], static_cast<int>(categories.size()));
             if (fresh) categories.push_back(f[1]);
-            products[f[0]] = category->second;
+            products.fallback[f[0]] = category->second;
         });
         for (auto chunk : campaign_files.chunks) each_line(chunk, [&](Text line) {
             std::array<Text, 2> f;
             if (!fields(line, f)) return;
-            campaigns.emplace(f[0], static_cast<int>(campaign_ids.size()));
+            campaigns.fallback.emplace(f[0], static_cast<int>(campaign_ids.size()));
             campaign_ids.push_back(f[0]);
             channels.push_back(f[1]);
         });
+        products.compact();
+        campaigns.compact();
     }
 };
 
-struct Event { Name person; Millis ts; int price, category; };
-struct Click { Name person; Text id; Millis ts; int campaign; };
+struct Sale { int price, category; };
+
+// Use exact relative milliseconds and the published price bound whenever the
+// manifest span and catalog fit. Wider workloads use per-reader side tables.
+struct PackedValues {
+    Millis origin;
+    bool narrow_time, narrow_sales;
+    std::vector<std::vector<Millis>> full_times;
+    std::vector<std::vector<Sale>> full_sales;
+    PackedValues(Millis start, Millis end, std::size_t categories)
+        : origin(start - week_ms), narrow_time(end - origin <= UINT32_MAX),
+          narrow_sales(categories <= 256), full_times(threads), full_sales(threads) {}
+
+    template<typename T>
+    std::uint32_t store(std::vector<std::vector<T>>& all, std::size_t reader, T value) {
+        auto& values = all[reader];
+        if (values.size() >= (UINT32_MAX >> 3)) throw std::length_error("too many wide values");
+        auto key = static_cast<std::uint32_t>((values.size() << 3) | reader);
+        values.push_back(value);
+        return key;
+    }
+    std::uint32_t time(Millis value, std::size_t reader) {
+        return narrow_time ? static_cast<std::uint32_t>(value - origin) : store(full_times, reader, value);
+    }
+    Millis millis(std::uint32_t key) const {
+        return narrow_time ? origin + key : full_times[key & 7][key >> 3];
+    }
+    std::uint32_t purchase(int price, int category, std::size_t reader) {
+        if (!price) return 0;
+        return narrow_sales ? (std::uint32_t(category) << 24) | price : store(full_sales, reader, Sale{price, category}) + 1;
+    }
+    Sale sale(std::uint32_t key) const {
+        if (narrow_sales) return {int(key & 0xffffff), int(key >> 24)};
+        if (!key) return {};
+        --key;
+        return full_sales[key & 7][key >> 3];
+    }
+};
+
+struct Event { Name person; std::uint32_t stamp, purchase; };
+struct Click { Name person, id; std::uint32_t stamp; int campaign; };
 struct Version { Name id; Millis ingest; Event event; };
 
 Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, Millis end,
-                     const People& people, const Catalog& catalog, NamePool& names) {
+                     const Catalog& catalog, NamePool& names, PackedValues& values, std::size_t reader) {
     if (f[1].empty() || f[5].empty()) return {};
     const auto ts = timestamp(f[2]);
     if (ts < start || ts >= end || ingest - ts > day_ms) return {};
@@ -143,52 +212,75 @@ Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, 
         price = static_cast<int>(number(f[6], 10'000'000));
         if (price < 1) return {};
         auto product = catalog.products.find(f[5]);
-        if (product != catalog.products.end()) category = product->second;
+        if (product >= 0) category = product;
     } else if (f[4] != "view" && f[4] != "cart") return {};
-    return {people.find(names.get(f[1])), ts, price, category};
+    return {names.get(f[1]), values.time(ts, reader), values.purchase(price, category, reader)};
 }
 
-void load_events(const Files& files, const People& people, const Catalog& catalog,
-                 Millis start, Millis end, Partition<Event>& out, std::vector<NamePool>& names) {
-    Partition<Version> versions;
+void load_events(const Files& files, const Files& links, std::optional<People>& people, const Catalog& catalog,
+                 Millis start, Millis end, Partition<Event>& out, std::vector<NamePool>& names, PackedValues& values) {
+    constexpr std::size_t id_shards = 256;
+    Partition<Version, id_shards> versions;
     versions.reserve_rows(files.estimated_rows());
     std::vector<NamePool> ids(threads);
-    parallel(files.chunks.size(), [&](auto t, auto j) {
-        records<7>(files.chunks[j], [&](const auto& f) {
+    parallel(files.chunks.size() + 1, [&](auto t, auto j) {
+        if (j == 0) { people.emplace(links); return; }
+        records<7>(files.chunks[j - 1], [&](const auto& f) {
             if (f[0].empty()) return;
             auto id = ids[t].get(f[0]);
             auto hash = id.hash();
             auto ingest = ingest_time(f[3]);
             if (ingest == invalid_time) return;
             // Retain the earliest version even when its payload fails validation.
-            versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, people, catalog, names[t])});
+            versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, catalog, names[t], values, t)});
         });
     });
     out.reserve_rows(files.estimated_rows());
-    parallel(shards, [&](auto t, auto shard) {
-        std::size_t count = 0, capacity = 1;
+    parallel(id_shards, [&](auto t, auto shard) {
+        std::size_t count = 0;
         for (const auto& worker : versions.local) count += worker[shard].size();
-        while (capacity < count + count / 2) capacity *= 2;
-        std::vector<const Version*> slots(capacity);
-        for (const auto& worker : versions.local) {
-            for (const auto& row : worker[shard]) {
-                // Low hash bits already selected the shard. Probe with the remaining bits.
-                auto slot = (row.id.hash() / shards) & (capacity - 1);
-                while (slots[slot] && slots[slot]->id != row.id)
-                    slot = (slot + 1) & (capacity - 1);
-                if (!slots[slot] || row.ingest < slots[slot]->ingest) slots[slot] = &row;
+        std::size_t words = 1;
+        while (words * 4 < count) words *= 2;
+        // A bucket touched just once proves its identifier is unique. Repeated
+        // buckets, including accidental hash collisions, still get exact compares.
+        std::vector<std::uint64_t> seen(words), repeated(words);
+        std::size_t collisions = 0;
+        for (const auto& worker : versions.local) for (const auto& row : worker[shard]) {
+            const auto hash = row.id.hash() / id_shards;
+            auto word = (hash >> 6) & (words - 1);
+            auto bit = UINT64_C(1) << (hash & 63);
+            auto conflict = seen[word] & bit;
+            collisions += conflict != 0;
+            repeated[word] |= conflict;
+            seen[word] |= bit;
+        }
+        std::size_t capacity = 1;
+        while (capacity < std::min(count, collisions * 2) * 2) capacity *= 2;
+        std::vector<Version*> slots(capacity);
+        auto emit = [&](Event event) {
+            if (!event.person.empty()) {
+                event.person = people->find(event.person);
+                out.add(t, event.person.hash(), event);
             }
+        };
+        for (auto& worker : versions.local) for (auto& row : worker[shard]) {
+            const auto hash = row.id.hash() / id_shards;
+            const auto word = (hash >> 6) & (words - 1);
+            if (!(repeated[word] & (UINT64_C(1) << (hash & 63)))) {
+                emit(row.event);
+                continue;
+            }
+            auto slot = (hash ^ (hash >> 24)) & (capacity - 1);
+            while (slots[slot] && slots[slot]->id != row.id) slot = (slot + 1) & (capacity - 1);
+            if (!slots[slot] || row.ingest < slots[slot]->ingest) slots[slot] = &row;
         }
-        for (auto row : slots) {
-            if (row && !row->event.person.empty())
-                out.add(t, row->event.person.hash(), row->event);
-        }
+        for (auto* row : slots) if (row) emit(row->event);
         for (auto& worker : versions.local) std::vector<Version>().swap(worker[shard]);
     });
 }
 
 void load_clicks(const Files& files, const People& people, const Catalog& catalog,
-                 Millis start, Millis end, Partition<Click>& out, std::vector<NamePool>& names) {
+                 Millis start, Millis end, Partition<Click>& out, std::vector<NamePool>& names, PackedValues& values) {
     out.reserve_rows(files.estimated_rows());
     parallel(files.chunks.size(), [&](auto t, auto j) {
         records<4>(files.chunks[j], [&](const auto& f) {
@@ -196,9 +288,9 @@ void load_clicks(const Files& files, const People& people, const Catalog& catalo
             auto ts = timestamp(f[3]);
             if (ts < start - week_ms || ts >= end) return;
             auto campaign = catalog.campaigns.find(f[2]);
-            if (campaign == catalog.campaigns.end()) return;
+            if (campaign < 0) return;
             auto person = people.find(names[t].get(f[1]));
-            out.add(t, person.hash(), {person, f[0], ts, campaign->second});
+            out.add(t, person.hash(), {person, names[t].get(f[0]), values.time(ts, t), campaign});
         });
     });
 }
@@ -245,41 +337,122 @@ struct CampaignTotals {
     }
 };
 
-void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Catalog& catalog,
-               CampaignTotals& totals, UserRows& users) {
-    struct TimedEvent { Millis ts; int price, category; };
-    struct TimedClick { Millis ts; Text id; int campaign; };
+struct TimedEvent { Millis ts; int price, category; };
+
+// A half-hour bin forms one connected piece of a session. Only its earliest
+// and latest event can determine whether it joins the adjacent nonempty bin.
+struct SessionOrder {
+    struct Bin { std::size_t count = 0, begin, cursor, earliest, latest; };
+    Millis origin;
+    std::vector<Bin> bins;
+    std::vector<TimedEvent> scratch;
+    SessionOrder(Millis start, Millis end) : origin(start) {
+        const auto n = (end - start) / session_gap + 1;
+        if (n > 0 && n <= 8192) bins.resize(n);
+    }
+    void arrange(std::vector<TimedEvent>& data, std::size_t begin, std::size_t end) {
+        auto n = end - begin;
+        if (bins.empty() || n < 128 || n * 4 < bins.size()) {
+            std::sort(data.begin()+begin, data.begin()+end, [](const auto& a, const auto& b) {return a.ts < b.ts;});
+            return;
+        }
+        auto bucket = [&](Millis ts) { return std::size_t((ts - origin) / session_gap); };
+        for (auto i = begin; i < end; ++i) ++bins[bucket(data[i].ts)].count;
+        std::size_t position = 0;
+        for (auto& b : bins) if (b.count) {
+            b.earliest = b.latest = b.cursor = b.begin = position;
+            position += b.count;
+        }
+        scratch.resize(n);
+        for (auto i = begin; i < end; ++i) {
+            const auto& event = data[i];
+            auto& b = bins[bucket(event.ts)];
+            auto pos = b.cursor++;
+            scratch[pos] = event;
+            if (event.ts < scratch[b.earliest].ts) b.earliest = pos;
+            if (event.ts > scratch[b.latest].ts) b.latest = pos;
+        }
+        for (auto& b : bins) if (b.count) {
+            std::swap(scratch[b.begin], scratch[b.earliest]);
+            if (b.latest == b.begin) b.latest = b.earliest;
+            std::swap(scratch[b.cursor-1], scratch[b.latest]);
+            b.count = 0;
+        }
+        std::copy(scratch.begin(), scratch.end(), data.begin()+begin);
+    }
+};
+
+void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::size_t shard, const Catalog& catalog,
+               CampaignTotals& totals, UserRows& users, Millis start, Millis end, const PackedValues& values) {
+    SessionOrder order(start, end);
+    struct TimedClick { Millis ts; Name id; int campaign; };
     struct Activity {
         Name person;
-        std::vector<TimedEvent> events;
-        std::vector<TimedClick> clicks;
+        std::size_t event_begin = 0, event_end = 0, click_begin = 0, click_end = 0;
     };
+    std::size_t raw_count = 0;
+    for (const auto& worker : raw_events.local) raw_count += worker[shard].size();
     std::vector<Activity> people;
-    std::unordered_map<Name, std::size_t, NameHash> positions;
-    positions.reserve(events.size() / 16);
-    people.reserve(events.size() / 16);
-    for (const auto& e : events) {
-        auto [pos, fresh] = positions.try_emplace(e.person, people.size());
-        if (fresh) people.push_back({e.person, {}, {}});
-        people[pos->second].events.push_back({e.ts, e.price, e.category});
+    people.reserve(raw_count / 16);
+    std::size_t capacity = 16;
+    while (capacity < raw_count / 8) capacity *= 2;
+    std::vector<int> slots(capacity, -1);
+    auto locate = [&](Name person) {
+        auto mask = slots.size() - 1;
+        auto pos = person.hash() & mask;
+        while (slots[pos] != -1 && people[slots[pos]].person != person) pos = (pos + 1) & mask;
+        return pos;
+    };
+    // Count once, then scatter into contiguous runs. The temporary group number
+    // replaces the identity in these shard-local rows after its final lookup.
+    for (auto& worker : raw_events.local) for (auto& e : worker[shard]) {
+        auto pos = locate(e.person);
+        if (slots[pos] == -1) {
+            if (people.size() * 10 >= slots.size() * 7) {
+                slots.assign(slots.size() * 2, -1);
+                for (std::size_t i = 0; i < people.size(); ++i) slots[locate(people[i].person)] = i;
+                pos = locate(e.person);
+            }
+            slots[pos] = people.size();
+            people.push_back({e.person});
+        }
+        auto i = slots[pos];
+        ++people[i].event_end;
+        e.person.value = i;
     }
-    std::vector<Event>().swap(events);
-    for (const auto& c : clicks) {
-        auto pos = positions.find(c.person);
-        if (pos != positions.end()) people[pos->second].clicks.push_back({c.ts, c.id, c.campaign});
+    for (auto& worker : raw_clicks.local) for (auto& c : worker[shard]) {
+        auto i = slots[locate(c.person)];
+        if (i >= 0) ++people[i].click_end;
+        c.person.value = i < 0 ? Name::external : static_cast<std::uint64_t>(i);
     }
-    std::vector<Click>().swap(clicks);
+    std::size_t ne = 0, nc = 0;
+    for (auto& p : people) {
+        p.event_begin = ne; ne += p.event_end; p.event_end = p.event_begin;
+        p.click_begin = nc; nc += p.click_end; p.click_end = p.click_begin;
+    }
+    std::vector<TimedEvent> events(ne);
+    std::vector<TimedClick> clicks(nc);
+    for (auto& worker : raw_events.local) {
+        for (const auto& e : worker[shard]) {
+            auto sale = values.sale(e.purchase);
+            events[people[e.person.value].event_end++] = {values.millis(e.stamp), sale.price, sale.category};
+        }
+        std::vector<Event>().swap(worker[shard]);
+    }
+    for (auto& worker : raw_clicks.local) {
+        for (const auto& c : worker[shard]) if (!c.person.empty())
+            clicks[people[c.person.value].click_end++] = {values.millis(c.stamp), c.id, c.campaign};
+        std::vector<Click>().swap(worker[shard]);
+    }
     std::vector<int> click_counts(catalog.campaign_ids.size()), positions_in_window(click_counts.size());
     std::vector<int> active, purchased;
     std::vector<std::int64_t> category_revenue(catalog.categories.size());
     for (auto& activity : people) {
-        auto& events = activity.events;
-        auto& clicks = activity.clicks;
-        std::sort(events.begin(), events.end(), [](const TimedEvent& a, const TimedEvent& b) { return a.ts < b.ts; });
-        std::sort(clicks.begin(), clicks.end(), [](const TimedClick& a, const TimedClick& b) {
+        order.arrange(events, activity.event_begin, activity.event_end);
+        std::sort(clicks.begin() + activity.click_begin, clicks.begin() + activity.click_end, [](const TimedClick& a, const TimedClick& b) {
             return a.ts == b.ts ? a.id > b.id : a.ts < b.ts;
         });
-        std::size_t ei = 0, left = 0, right = 0;
+        std::size_t ei = activity.event_begin, left = activity.click_begin, right = left;
         int user_day = 0, sessions = 0;
         std::int64_t daily_events = 0, daily_revenue = 0;
         auto write_day = [&] {
@@ -297,7 +470,7 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
             users.append(activity.person, user_day, sessions, daily_events, daily_revenue,
                          best < 0 ? nullptr : &catalog.categories[best]);
         };
-        while (ei < events.size()) {
+        while (ei < activity.event_end) {
             Millis start = events[ei].ts;
             int day = static_cast<int>(start / day_ms - (start % day_ms < 0));
             if (sessions && day != user_day) {
@@ -316,12 +489,12 @@ void aggregate(std::vector<Event>& events, std::vector<Click>& clicks, const Cat
                     if (!category_revenue[event.category]) purchased.push_back(event.category);
                     category_revenue[event.category] += event.price;
                 }
-            } while (ei < events.size() && events[ei].ts - events[ei - 1].ts <= session_gap);
+            } while (ei < activity.event_end && events[ei].ts - events[ei - 1].ts <= session_gap);
             daily_events += ei - first;
             daily_revenue += revenue;
             // Identical duplicate clicks enter and leave together. Only distinct campaigns
             // and the identity of the final click affect either output.
-            while (right < clicks.size() && clicks[right].ts <= start) {
+            while (right < activity.click_end && clicks[right].ts <= start) {
                 int id = clicks[right++].campaign;
                 if (click_counts[id]++ == 0) {
                     positions_in_window[id] = active.size();
@@ -361,13 +534,14 @@ int main(int argc, char** argv) {
         threads = std::clamp(std::stoi(argv[5]), 1, 8);
         Files links(data / "links"), products(data / "products.csv"), campaigns(data / "campaigns.csv");
         Files event_files(data / "events"), click_files(data / "clicks");
-        People people(links);
+        std::optional<People> people;
         Catalog catalog(products, campaigns);
+        PackedValues values(start, end, catalog.categories.size());
         Partition<Event> events;
         Partition<Click> clicks;
         std::vector<NamePool> names(threads);
-        load_events(event_files, people, catalog, start, end, events, names);
-        load_clicks(click_files, people, catalog, start, end, clicks, names);
+        load_events(event_files, links, people, catalog, start, end, events, names, values);
+        load_clicks(click_files, *people, catalog, start, end, clicks, names, values);
         auto day_of = [](Millis ts) { return int(ts / day_ms - (ts % day_ms < 0)); };
         std::vector<CampaignTotals> totals;
         for (std::size_t t = 0; t < threads; ++t)
@@ -388,9 +562,7 @@ int main(int argc, char** argv) {
         std::sort(order.rbegin(), order.rend());
         parallel(shards, [&](auto t, auto job) {
             auto shard = order[job].second;
-            auto e = events.take(shard);
-            auto c = clicks.take(shard);
-            aggregate(e, c, catalog, totals[t], users[t]);
+            aggregate(events, clicks, shard, catalog, totals[t], users[t], start, end, values);
         });
         for (auto& stream : users) stream.close();
         SparseTotals combined;

@@ -116,7 +116,7 @@ template <std::size_t N> bool fields(Text line, std::array<Text, N>& out) {
 }
 
 #if defined(__SSE2__)
-#include <emmintrin.h>
+#include <immintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -148,6 +148,35 @@ inline Separators scan64(const char* bytes) {
     }
     return result;
 }
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2"))) inline Separators scan64_avx2(const char* bytes) {
+    Separators result{};
+    for (int offset = 0; offset < 64; offset += 32) {
+        auto x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes + offset));
+        auto commas = _mm256_cmpeq_epi8(x, _mm256_set1_epi8(','));
+        auto newlines = _mm256_cmpeq_epi8(x, _mm256_set1_epi8('\n'));
+        auto quotes = _mm256_cmpeq_epi8(x, _mm256_set1_epi8('"'));
+        auto ends = static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(commas, newlines)));
+        auto quote_bits = static_cast<std::uint32_t>(_mm256_movemask_epi8(quotes));
+        result.endings |= std::uint64_t(ends) << offset;
+        result.quotes |= std::uint64_t(quote_bits) << offset;
+    }
+    return result;
+}
+#endif
+
+inline unsigned quote_count(std::uint64_t bits) {
+#if defined(__x86_64__) && !defined(__POPCNT__)
+    // Generic x86 can otherwise enter a software population-count routine once
+    // per field. The CSV grammar distinguishes zero, one, two, and three or more.
+    if (!bits) return 0;
+    const auto rest = bits & (bits - 1);
+    return 1 + (rest != 0) + ((rest & (rest - 1)) != 0);
+#else
+    return __builtin_popcountll(bits);
+#endif
+}
+
 #endif
 
 // Fields can be quoted, but the input contract forbids embedded delimiters.
@@ -176,6 +205,11 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
         }
         quotes = 0;
     };
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+    const auto scan_block = __builtin_cpu_supports("avx2") ? &scan64_avx2 : &scan64;
+#else
+    constexpr auto scan_block = &scan64;
+#endif
     const char* block = bytes.data();
     std::size_t remaining = bytes.size();
     while (remaining) {
@@ -183,18 +217,18 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
         char tail[64] = {};
         const char* scan = block;
         if (n < 64) { std::memcpy(tail, block, n); scan = tail; }
-        auto marks = scan64(scan);
+        auto marks = scan_block(scan);
         while (marks.endings) {
             const unsigned bit = __builtin_ctzll(marks.endings);
             const auto before = (marks.endings & -marks.endings) - 1;
-            quotes += __builtin_popcountll(marks.quotes & before);
+            quotes += quote_count(marks.quotes & before);
             marks.quotes &= ~before;
             const auto* end = block + bit;
             field(end, *end == '\n');
             first = end + 1;
             marks.endings &= marks.endings - 1;
         }
-        quotes += __builtin_popcountll(marks.quotes);
+        quotes += quote_count(marks.quotes);
         block += n;
         remaining -= n;
     }
@@ -212,6 +246,20 @@ inline std::int64_t number(Text value, std::int64_t limit) {
     // Nineteen decimal digits always fit in uint64_t; range-check once after parsing.
     if (value.empty() || value.size() > 19) return -1;
     std::uint64_t n = 0;
+    while (value.size() >= 8) {
+        std::uint64_t digits;
+        std::memcpy(&digits, value.data(), 8);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        digits = __builtin_bswap64(digits);
+#endif
+        if (((digits - UINT64_C(0x3030303030303030)) | (digits + UINT64_C(0x4646464646464646)))
+            & UINT64_C(0x8080808080808080)) return -1;
+        digits &= UINT64_C(0x0f0f0f0f0f0f0f0f);
+        digits = (digits * 10 + (digits >> 8)) & UINT64_C(0x00ff00ff00ff00ff);
+        digits = (digits * 100 + (digits >> 16)) & UINT64_C(0x0000ffff0000ffff);
+        n = n * 100000000 + (digits & 65535) * 10000 + (digits >> 32);
+        value.remove_prefix(8);
+    }
     for (char ch : value) {
         if (ch < '0' || ch > '9') return -1;
         n = n * 10 + (ch - '0');
@@ -229,17 +277,43 @@ inline int unix_day(int y, int m, int d) {
 
 constexpr Millis invalid_time = INT64_MIN;
 
-inline int two_digits(Text value, int i) {
-    return (value[i] - '0') * 10 + value[i + 1] - '0';
+inline unsigned digit_pair(const char* p) {
+    static const auto decoded = [] {
+        std::array<unsigned char, 65536> table;
+        table.fill(255);
+        for (unsigned a = 0; a < 10; ++a) for (unsigned b = 0; b < 10; ++b)
+            table[('0' + a) | (('0' + b) << 8)] = 10 * a + b;
+        return table;
+    }();
+    return decoded[static_cast<unsigned char>(p[0]) | (static_cast<unsigned char>(p[1]) << 8)];
 }
 
-// The input contract guarantees a valid, fixed-width UTC timestamp in ingest_ts.
+inline Millis midnight(const char* p) {
+    struct Date { std::uint64_t prefix = 0; Millis millis = invalid_time; };
+    static thread_local std::array<Date, 32> dates;
+    const auto d = digit_pair(p + 8);
+    if (d == 0 || d > 31) return invalid_time;
+    std::uint64_t prefix;
+    std::memcpy(&prefix, p, 8);
+    auto& date = dates[d];
+    if (date.prefix == prefix) return date.millis;
+    if (p[4] != '-' || p[7] != '-') return invalid_time;
+    const auto century = digit_pair(p), y = digit_pair(p + 2), m = digit_pair(p + 5);
+    const auto year = century * 100 + y;
+    if (century > 99 || y > 99 || year == 0 || m == 0 || m > 12) return invalid_time;
+    constexpr unsigned days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    const auto leap = m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (d > days[m - 1] + leap) return invalid_time;
+    date = {prefix, unix_day(year, m, d) * day_ms};
+    return date.millis;
+}
+
 inline Millis ingest_time(Text value) {
     if (value.size() != 20) return invalid_time;
-    int year = two_digits(value, 0) * 100 + two_digits(value, 2);
-    int day = unix_day(year, two_digits(value, 5), two_digits(value, 8));
-    int second = (two_digits(value, 11) * 60 + two_digits(value, 14)) * 60 + two_digits(value, 17);
-    return day * day_ms + second * 1000;
+    const auto* p = value.data();
+    // ingest_ts is guaranteed to be a valid F1 timestamp.
+    const auto seconds = (digit_pair(p + 11) * 60 + digit_pair(p + 14)) * 60 + digit_pair(p + 17);
+    return midnight(p) + seconds * 1000;
 }
 
 inline Millis timestamp(Text value) {
@@ -248,23 +322,20 @@ inline Millis timestamp(Text value) {
         return n < 0 ? invalid_time : n;
     }
     if (value.size() != 20 && value.size() != 25) return invalid_time;
-    if (value[7] != '-' || value[10] != 'T' || value[13] != ':' || value[16] != ':') return invalid_time;
-    for (auto pos : {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18})
-        if (value[pos] < '0' || value[pos] > '9') return invalid_time;
-    auto pair = [&](int i) { return two_digits(value, i); };
-    int year = pair(0) * 100 + pair(2), month = pair(5), day = pair(8);
-    int hour = pair(11), min = pair(14), sec = pair(17), offset = 0;
-    constexpr std::array<int, 12> days = {31,28,31,30,31,30,31,31,30,31,30,31};
-    if (year == 0 || month < 1 || month > 12) return invalid_time;
-    int leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (day < 1 || day > days[month - 1] + leap || hour > 23 || min > 59 || sec > 59) return invalid_time;
+    const auto* p = value.data();
+    if (p[10] != 'T' || p[13] != ':' || p[16] != ':') return invalid_time;
+    const auto hour = digit_pair(p + 11), minute = digit_pair(p + 14), sec = digit_pair(p + 17);
+    if (hour > 23 || minute > 59 || sec > 59) return invalid_time;
+    int offset = 0;
     if (value.size() == 20) {
-        if (value[19] != 'Z') return invalid_time;
+        if (p[19] != 'Z') return invalid_time;
     } else {
-        if ((value[19] != '+' && value[19] != '-') || value[22] != ':') return invalid_time;
-        for (auto pos : {20, 21, 23, 24}) if (value[pos] < '0' || value[pos] > '9') return invalid_time;
-        if (pair(20) > 23 || pair(23) > 59) return invalid_time;
-        offset = (pair(20) * 60 + pair(23)) * (value[19] == '+' ? 1 : -1);
+        if ((p[19] != '+' && p[19] != '-') || p[22] != ':') return invalid_time;
+        const auto h = digit_pair(p + 20), m = digit_pair(p + 23);
+        if (h > 23 || m > 59) return invalid_time;
+        offset = static_cast<int>(h * 60 + m) * (p[19] == '+' ? 1 : -1);
     }
-    return unix_day(year, month, day) * day_ms + ((hour * 60 + min - offset) * 60 + sec) * 1000LL;
+    const auto day = midnight(p);
+    if (day == invalid_time) return day;
+    return day + ((static_cast<int>(hour * 60 + minute) - offset) * 60 + static_cast<int>(sec)) * 1000LL;
 }

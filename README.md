@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps nine-byte ASCII identifiers in one machine word. Other identifiers retain their full source bytes. Each worker sorts its users’ events and clicks, tracks the seven-day attribution window and writes typed Parquet row groups directly through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps nine-byte ASCII identifiers in one machine word. Other identifiers retain their full source bytes. Workers overlap link construction with event parsing. A singly occupied hash bucket certifies a unique event ID. Repeated buckets receive full ID and ingestion-time comparisons. Each worker groups its users’ activity in contiguous buffers, orders dense users by half-hour bins, tracks the seven-day attribution window and writes typed Parquet row groups through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run locally
 
@@ -32,14 +32,16 @@ Use this directory as the public repository root and submit its Git commit on th
 
 ## Validation and timing
 
-All 36 organizer fixtures passed. Both tables matched the public million-event answer exactly, with 117,038 user-days and 27,400 campaign-days. On a separate generator seed with 20 million events and 5 million clicks, all 2,241,647 user-days and 28,014 campaign-days matched the previous implementation, including nulls and duplicate-key checks.
+All 36 organizer fixtures passed. Both tables matched the public million-event answer exactly, with 117,038 user-days and 27,400 campaign-days. Both tables also matched commit `0434f79` on two separately generated 20-million-event inputs. Seed 71 produced 2,241,647 unique user-days and seed 1049 produced 2,254,399. Each produced 28,014 campaign-days. The organizer’s comparator reported zero missing rows, differing rows or duplicate keys.
 
-End-to-end times on an Apple M4 were medians of five alternating runs per version, with eight workers and warm input files. The baselines used commit `df65661`. The hosted scorer uses a Linux/amd64 container and hidden data.
+The comparison below used an Apple M4 with eight workers. Each cell is the median of five warm end-to-end runs, alternating execution order while other builds were running on the host. The official scorer times Linux/amd64 containers on hidden data.
 
-| Generated input | Previous version | Current version |
-| --- | ---: | ---: |
-| 1M events, 250k clicks, seed 1 | 0.187 s | 0.085 s |
-| 20M events, 5M clicks, seed 71 | 2.438 s | 1.379 s |
+| Generated input | Commit `0434f79` | This version | Reduction |
+| --- | ---: | ---: | ---: |
+| 20M events, 5M clicks, seed 71 | 3.874 s | 2.328 s | 39.9% |
+| 20M events, 5M clicks, seed 1049 | 3.915 s | 2.536 s | 35.2% |
+
+An independent Python implementation verified a 40,000-event case with a wide date range, more than 255 purchase categories and mixed-width Unicode identifiers. It also verified a dense-event case with exact 30-minute boundaries, day transitions and tied click times. The reader uses AVX2, SSE2 or NEON when supported, with a scalar implementation for other architectures.
 
 Generate the larger workload after `make check-dev`.
 

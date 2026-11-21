@@ -23,6 +23,15 @@ struct Name {
         for (int i = 0; i < 9; ++i) storage[i] = (value >> (7 * i)) & 127;
         return Text(storage.data(), storage.size());
     }
+    bool operator>(Name other) const {
+        if (value == other.value) return false;
+        if (!((value | other.value) & external)) {
+            const auto shift = __builtin_ctzll(value ^ other.value) / 7 * 7;
+            return ((value >> shift) & 127) > ((other.value >> shift) & 127);
+        }
+        std::array<char, 9> a, b;
+        return view(a) > other.view(b);
+    }
     std::size_t hash() const {
         if (value & external) return std::hash<Text>{}(reference());
         const auto mixed = value * UINT64_C(0x9e3779b97f4a7c15);
