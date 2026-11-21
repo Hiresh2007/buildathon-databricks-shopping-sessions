@@ -14,8 +14,8 @@ check-dev: sessions .venv/.installed $(KIT)/scripts/run_fixtures.py .cache/dev/.
 	./sessions .cache/dev .cache/dev-output
 	$(PY) $(KIT)/scripts/compare.py .cache/dev-output .cache/dev-answer
 
-sessions: sessions.cpp input.hpp identity.hpp parquet_output.hpp build.py .venv/.installed
-	CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" $(PY) build.py
+sessions: sessions.cpp input.hpp identity.hpp parquet_output.hpp build.py
+	CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" $(PYTHON) build.py
 
 .venv/.installed: requirements.txt
 	$(PYTHON) -m venv .venv

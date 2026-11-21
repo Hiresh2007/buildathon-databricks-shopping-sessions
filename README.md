@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps eight-byte ASCII identifiers and nine-byte ASCII identifiers with a nonzero leading byte in one machine word. Other identifiers retain their full source bytes. Workers claim link and event chunks from the same queue. Concurrent union-find always attaches the larger identity to the smaller one. Each successful merge records the child for the final alias index. A singly occupied hash bucket certifies a unique event ID. Repeated buckets receive full ID and ingestion-time comparisons. Each worker groups its users’ activity in contiguous buffers, orders dense users by half-hour bins, tracks the seven-day attribution window and writes typed Parquet row groups through Apache Arrow’s C++ libraries. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
+This entry reconstructs shopping sessions across linked accounts and writes daily user and campaign Parquet tables. The C++17 pipeline parses memory-mapped CSVs, joins identities with union-find and resolves event versions by earliest ingestion. It keeps eight-byte ASCII identifiers and nine-byte ASCII identifiers with a nonzero leading byte in one machine word. Other identifiers retain their full source bytes. Workers claim link and event chunks from the same queue. Concurrent union-find always attaches the larger identity to the smaller one. Each successful merge records the child for the final alias index. A singly occupied hash bucket certifies a unique event ID. Repeated buckets receive full ID and ingestion-time comparisons. Each worker groups its users’ activity in contiguous buffers, orders dense users by half-hour bins, tracks the seven-day attribution window and writes plain Parquet pages with buffered POSIX writes. The executable encodes typed columns, optional definition levels and Compact Protocol metadata directly. [Organizer's rules](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions/files/rules.md?inline=1)
 
 ## Run locally
 
@@ -12,7 +12,7 @@ make check-dev
 ./sessions /path/to/input /path/to/output
 ```
 
-The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The native runner reads the manifest with Apache Arrow’s JSON parser and accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. The existing Python launcher handles additional ISO 8601 window representations. The runner uses up to eight workers from `NCPU`. It writes directly into the two output directories.
+The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The native runner reads the two timestamp fields of the manifest directly and accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. The Python launcher handles escaped JSON strings, additional manifest fields and additional ISO 8601 window representations. The runner uses up to eight workers from `NCPU`. It writes directly into the two output directories.
 
 ## Run the competition image
 
@@ -63,6 +63,8 @@ The eight- and nine-byte identifier encoding round-tripped 103,072 ASCII and bin
 The CSV scanner validates batches of complete rows and indexes their field boundaries. It uses the existing row scanner on malformed batches and long rows. For windows and purchase categories that fit the packed representation, sorting an eight-byte event key orders it by timestamp and preserves the purchase data. Wider inputs retain their full times and categories.
 
 On the Apple M4, alternating ten warm measured runs per build on seed 76129 (10M events, 2.5M clicks) gave medians of 0.8822 s for `3e79282` and 0.8252 s for this pipeline. CPU time fell from 3.3992 s to 3.2198 s. All rows matched. A sanitizer build matched an independent CSV decoder on 210,000 generated lines across the link, click and event schemas, including malformed rows, vector boundaries and unterminated final lines.
+
+The plain writer on this branch matched all 36 organizer fixtures on Linux/amd64. Both tested CPU feature sets produced the complete public million-event answers. On a separate 10-million-event dataset, the organizer comparator found 1,140,271 user-days and 28,014 campaign-days with zero differences. In six warm pairs on an Apple M4 with eight workers, median wall time changed from 0.6363 to 0.5940 seconds against commit `39b5ea5`. CPU time changed from 3.0675 to 3.0075 seconds. A nominal 60-million-event stress test used six hard-linked copies of the 10-million-event inputs. It used 7,641 MiB peak RSS and produced the same tables.
 
 Generate the larger workload after `make check-dev`.
 

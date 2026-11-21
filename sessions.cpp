@@ -1,5 +1,6 @@
 #include "parquet_output.hpp"
-#include <arrow/json/object_parser.h>
+#include <memory>
+#include <map>
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
@@ -659,11 +660,55 @@ std::optional<std::pair<Millis, Millis>> manifest_window(const fs::path& data) {
     std::ifstream input(data / "manifest.json");
     if (!input) throw std::runtime_error("cannot open " + (data / "manifest.json").string());
     std::string contents{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    arrow::json::internal::ObjectParser object;
-    if (!object.Parse(contents).ok()) return std::nullopt;
-    auto start = object.GetString("window_start");
-    auto end = object.GetString("window_end");
-    if (!start.ok() || !end.ok()) return std::nullopt;
+    Text text(contents);
+    std::optional<Text> start, end;
+    auto skip = [&] {
+        while (!text.empty() &&
+               (text.front() == ' ' || text.front() == '\t' || text.front() == '\r' || text.front() == '\n'))
+            text.remove_prefix(1);
+    };
+    auto take = [&](char c) {
+        skip();
+        if (text.empty() || text.front() != c)
+            return false;
+        text.remove_prefix(1);
+        return true;
+    };
+    auto quoted = [&]() -> std::optional<Text> {
+        if (!take('"'))
+            return {};
+        auto k = text.find('"');
+        if (k == Text::npos)
+            return {};
+        auto out = text.substr(0, k);
+        if (out.find('\\') != Text::npos)
+            return {};
+        text.remove_prefix(k + 1);
+        return out;
+    };
+    if (!take('{'))
+        return {};
+    for (int i = 0; i < 2; i++) {
+        if (i && !take(','))
+            return {};
+        auto key = quoted();
+        if (!key || !take(':'))
+            return {};
+        auto value = quoted();
+        if (!value)
+            return {};
+        if (*key == "window_start" && !start)
+            start = value;
+        else if (*key == "window_end" && !end)
+            end = value;
+        else
+            return {};
+    }
+    if (!take('}') || !start || !end)
+        return {};
+    skip();
+    if (!text.empty())
+        return {};
     auto parse_iso = [](Text s) {
         return (s.size() == 20 || s.size() == 25) && s[4] == '-' ? timestamp(s) : invalid_time;
     };
@@ -730,31 +775,48 @@ int main(int argc, char** argv) {
         for (auto& stream : users) stream.close();
         SparseTotals combined;
         for (const auto& local : totals) local.merge_into(combined);
-        auto campaign_file = parquet_file(output / "campaign_daily" / "part-0.parquet", {
-            column("campaign_id", pq::Type::BYTE_ARRAY, pq::ConvertedType::UTF8),
-            column("channel", pq::Type::BYTE_ARRAY, pq::ConvertedType::UTF8),
-            column("day", pq::Type::INT32, pq::ConvertedType::DATE), column("sessions", pq::Type::INT64),
-            column("purchasing_sessions", pq::Type::INT64), column("revenue_cents", pq::Type::INT64),
-            column("assisted_sessions", pq::Type::INT64)});
-        if (!combined.empty()) {
-            auto group = campaign_file->AppendRowGroup();
-            std::vector<pq::ByteArray> ids, channels;
-            std::vector<std::int32_t> days;
-            std::vector<std::int64_t> counts, purchasing, revenue, assists;
-            for (const auto& [key, metrics] : combined) {
-                ids.push_back(binary(catalog.campaign_ids[key.id]));
-                channels.push_back(binary(catalog.channels[key.id]));
-                days.push_back(key.day); counts.push_back(metrics.sessions);
-                purchasing.push_back(metrics.purchasing); revenue.push_back(metrics.revenue);
-                assists.push_back(metrics.assists);
-            }
-            put_column<pq::ByteArrayWriter>(group, ids); put_column<pq::ByteArrayWriter>(group, channels);
-            put_column<pq::Int32Writer>(group, days); put_column<pq::Int64Writer>(group, counts);
-            put_column<pq::Int64Writer>(group, purchasing); put_column<pq::Int64Writer>(group, revenue);
-            put_column<pq::Int64Writer>(group, assists);
-            group->Close();
+        FlatParquet report(output / "campaign_daily" / "part-0.parquet", {{"campaign_id", 6, 0},
+                                                                          {"channel", 6, 0},
+                                                                          {"day", 1, 6},
+                                                                          {"sessions", 2},
+                                                                          {"purchasing_sessions", 2},
+                                                                          {"revenue_cents", 2},
+                                                                          {"assisted_sessions", 2}});
+        Bytes ids, channels;
+        std::vector<std::int32_t> days;
+        std::vector<std::int64_t> counts, purchasing, revenue, assists;
+        auto flush = [&] {
+            if (days.empty())
+                return;
+            report.begin(days.size());
+            report.page(ids.data(), ids.size());
+            report.page(channels.data(), channels.size());
+            report.ints(days);
+            report.ints(counts);
+            report.ints(purchasing);
+            report.ints(revenue);
+            report.ints(assists);
+            ids.clear();
+            channels.clear();
+            days.clear();
+            counts.clear();
+            purchasing.clear();
+            revenue.clear();
+            assists.clear();
+        };
+        for (const auto &[key, metrics] : combined) {
+            byte_string(ids, catalog.campaign_ids[key.id]);
+            byte_string(channels, catalog.channels[key.id]);
+            days.push_back(key.day);
+            counts.push_back(metrics.sessions);
+            purchasing.push_back(metrics.purchasing);
+            revenue.push_back(metrics.revenue);
+            assists.push_back(metrics.assists);
+            if (days.size() >= 32768 || ids.size() >= (1U << 26) || channels.size() >= (1U << 26))
+                flush();
         }
-        campaign_file->Close();
+        flush();
+        report.close();
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n';
         return 1;

@@ -1,5 +1,4 @@
 FROM python:3.12-slim-bookworm AS runtime
-RUN pip install --no-cache-dir --no-deps pyarrow==19.0.1
 
 FROM runtime AS build
 RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
