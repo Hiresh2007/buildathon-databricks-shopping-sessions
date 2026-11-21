@@ -269,7 +269,12 @@ struct PackedValues {
 
 struct Event { Name person; std::uint32_t stamp, purchase; };
 struct Click { Name person, id; std::uint32_t stamp; int campaign; };
-struct Version { Name id; Millis ingest; Event event; };
+// F1 has fixed-width UTC fields. Byte ordering is chronological ordering.
+struct Version {
+    Name id;
+    const char *ingest;
+    Event event;
+};
 
 Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, Millis end,
                      const Catalog& catalog, NamePool& names, PackedValues& values, std::size_t reader) {
@@ -298,15 +303,72 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
             graph->read(links.chunks[j], t);
             return;
         }
-        records<7>(files.chunks[j - links.chunks.size()], [&](const auto& f) {
-            if (f[0].empty()) return;
+        auto general = [&](const auto &f) {
+            if (f[0].empty())
+                return;
             auto id = ids[t].get(f[0]);
             auto hash = id.hash();
             auto ingest = ingest_time(f[3]);
-            if (ingest == invalid_time) return;
+            if (ingest == invalid_time)
+                return;
             // Retain the earliest version even when its payload fails validation.
-            versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, catalog, names[t], values, t)});
-        });
+            versions.add(
+                t, hash,
+                {id, f[3].data(), validate_event(f, ingest, start, end, catalog, names[t], values, t)});
+        };
+        // Field widths were verified from this row's delimiter and quote masks.
+        auto direct = [&](const char *row, const auto &shape) {
+            auto ptr = [&](unsigned i) { return row + shape.begin[i]; };
+            auto id = ids[t].get(Text(ptr(0), 9));
+            auto hash = id.hash();
+            auto ingest = ptr(3);
+            auto arrival_day = midnight(ingest);
+            if (arrival_day == invalid_time)
+                return;
+            auto emit = [&](Event event) { versions.add(t, hash, {id, ingest, event}); };
+            if (!shape.length[5]) {
+                emit({});
+                return;
+            }
+            Millis ts;
+            if (shape.length[2] == 20)
+                ts = timestamp_at_width<20>(ptr(2), ingest, arrival_day);
+            else if (shape.length[2] == 25)
+                ts = timestamp_at_width<25>(ptr(2), ingest, arrival_day);
+            else
+                ts = timestamp_at_width<13>(ptr(2));
+            if (ts < start || ts >= end) {
+                emit({});
+                return;
+            }
+            // An event at or after ingestion midnight is within the one-day allowance.
+            if (ts < arrival_day) {
+                auto lag = arrival_day - ts;
+                if (lag > day_ms || lag + 1000 * daytime<false>(ingest + 11) > day_ms) {
+                    emit({});
+                    return;
+                }
+            }
+            int price = 0, category = 0;
+            if (shape.length[4] == 8) {
+                if (std::memcmp(ptr(4), "purchase", 8)) {
+                    emit({});
+                    return;
+                }
+                price = number(Text(ptr(6), shape.length[6]), 10'000'000);
+                if (price < 1) {
+                    emit({});
+                    return;
+                }
+                category = std::max(0, catalog.products.find(Text(ptr(5), shape.length[5])));
+            } else if (std::memcmp(ptr(4), "view", 4) && std::memcmp(ptr(4), "cart", 4)) {
+                emit({});
+                return;
+            }
+            emit({names[t].get(Text(ptr(1), 9)), values.time(ts, t), values.purchase(price, category, t)});
+        };
+        FixedWidthRows<7, decltype(general), decltype(direct)> receiver(general, direct);
+        records<7>(files.chunks[j - links.chunks.size()], receiver);
     });
     people.emplace(*graph);
     graph.reset();
@@ -347,7 +409,8 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
             }
             auto slot = (hash ^ (hash >> 24)) & (capacity - 1);
             while (slots[slot] && slots[slot]->id != row.id) slot = (slot + 1) & (capacity - 1);
-            if (!slots[slot] || row.ingest < slots[slot]->ingest) slots[slot] = &row;
+            if (!slots[slot] || std::memcmp(row.ingest, slots[slot]->ingest, 20) < 0)
+                slots[slot] = &row;
         }
         for (auto* row : slots) if (row) emit(row->event);
         for (auto& worker : versions.local) std::vector<Version>().swap(worker[shard]);
@@ -358,15 +421,38 @@ void load_clicks(const Files& files, const People& people, const Catalog& catalo
                  Millis start, Millis end, Partition<Click>& out, std::vector<NamePool>& names, PackedValues& values) {
     out.reserve_rows(files.estimated_rows());
     parallel(files.chunks.size(), [&](auto t, auto j) {
-        records<4>(files.chunks[j], [&](const auto& f) {
-            if (f[0].empty() || f[1].empty()) return;
+        auto general = [&](const auto &f) {
+            if (f[0].empty() || f[1].empty())
+                return;
             auto ts = timestamp(f[3]);
-            if (ts < start - week_ms || ts >= end) return;
+            if (ts < start - week_ms || ts >= end)
+                return;
             auto campaign = catalog.campaigns.find(f[2]);
-            if (campaign < 0) return;
+            if (campaign < 0)
+                return;
             auto person = people.find(names[t].get(f[1]));
             out.add(t, person.hash(), {person, names[t].get(f[0]), values.time(ts, t), campaign});
-        });
+        };
+        // Field widths were verified from this row's delimiter and quote masks.
+        auto direct = [&](const char *row, const auto &shape) {
+            auto ptr = [&](unsigned i) { return row + shape.begin[i]; };
+            auto tsval = ptr(3);
+            auto ts = shape.length[3] == 13   ? timestamp_at_width<13>(tsval)
+                      : shape.length[3] == 20 ? timestamp_at_width<20>(tsval)
+                                              : timestamp_at_width<25>(tsval);
+            if (ts < start - week_ms || ts >= end)
+                return;
+            auto campaign = catalog.campaigns.find(Text(ptr(2), shape.length[2]));
+            if (campaign < 0)
+                return;
+            auto name = [&](unsigned i) {
+                return shape.length[i] == 9 ? names[t].get(Text(ptr(i), 9)) : names[t].get(Text(ptr(i), 8));
+            };
+            auto person = people.find(name(1));
+            out.add(t, person.hash(), {person, name(0), values.time(ts, t), campaign});
+        };
+        FixedWidthRows<4, decltype(general), decltype(direct)> receiver(general, direct);
+        records<4>(files.chunks[j], receiver);
     });
 }
 

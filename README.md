@@ -43,7 +43,7 @@ The comparison below used an Apple M4 with eight workers. Each cell is the media
 
 Commit `0146a00` adopted the native executable as the entrypoint and saved 43 ms at 1M events and 23 ms at 10M events in paired warm runs on the M4. The organizer’s comparator found identical outputs at both sizes. On the 10M input it compared 1,134,699 user-days and 28,014 campaign-days.
 
-The current CSV scanner checks quote placement using the separators on both sides of each 64-byte block. It selects AVX2 or SSE2 once per chunk on x86. The identity index stores aliases whose owner differs from their original ID. A compact membership bitmap skips lookups when no alias can have that hash. Within each user shard, the grouping table uses hash bits above those that selected the shard.
+The block scanner checks quote placement using the separators on both sides of each 64-byte block. It selects AVX2 or SSE2 once per chunk on x86. The identity index stores aliases whose owner differs from their original ID. A compact membership bitmap skips lookups when no alias can have that hash. Within each user shard, the grouping table uses hash bits above those that selected the shard.
 
 These end-to-end medians compare six measured pairs after one warm-up. The host was also running other builds. The official comparator matched every row of both tables against commit `0146a00`, including 2,241,391 user-days and 28,014 campaign-days on the new 20M seed.
 
@@ -60,11 +60,15 @@ The parallel identity graph matched commit `2d4625f` on an independent 20-millio
 
 The eight- and nine-byte identifier encoding round-tripped 103,072 ASCII and binary strings and matched one million bytewise ordering and equality comparisons. Both output tables matched the organizer’s million-event answers and the previous implementation on an independent 10-million-event input (seed 76129).
 
-The CSV scanner validates batches of complete rows and indexes their field boundaries. It uses the existing row scanner on malformed batches and long rows. For windows and purchase categories that fit the packed representation, sorting an eight-byte event key orders it by timestamp and preserves the purchase data. Wider inputs retain their full times and categories.
+The earlier batch scanner validated complete rows and indexed their field boundaries. For windows and purchase categories that fit the packed representation, sorting an eight-byte event key orders it by timestamp and preserves the purchase data. Wider inputs retain their full times and categories.
 
 On the Apple M4, alternating ten warm measured runs per build on seed 76129 (10M events, 2.5M clicks) gave medians of 0.8822 s for `3e79282` and 0.8252 s for this pipeline. CPU time fell from 3.3992 s to 3.2198 s. All rows matched. A sanitizer build matched an independent CSV decoder on 210,000 generated lines across the link, click and event schemas, including malformed rows, vector boundaries and unterminated final lines.
 
 The plain writer on this branch matched all 36 organizer fixtures on Linux/amd64. Both tested CPU feature sets produced the complete public million-event answers. On a separate 10-million-event dataset, the organizer comparator found 1,140,271 user-days and 28,014 campaign-days with zero differences. In six warm pairs on an Apple M4 with eight workers, median wall time changed from 0.6363 to 0.5940 seconds against commit `39b5ea5`. CPU time changed from 3.0675 to 3.0075 seconds. A nominal 60-million-event stress test used six hard-linked copies of the 10-million-event inputs. It used 7,641 MiB peak RSS and produced the same tables.
+
+The current scanner caches up to 128 bytes of CSV structure per row shape. It verifies the complete delimiter and quote masks before reusing field offsets. Common event and click widths have specialized field readers. Longer records, other widths and machines without SIMD use the general decoder. Fixed-width UTC ingestion timestamps compare chronologically as bytes during deduplication. The event validator only decodes the ingestion time of day when the date alone leaves the one-day lateness test undecided.
+
+On the Apple M4 using eight workers, ten alternating warm pairs on seed 76129 (10M events and 2.5M clicks) measured 0.5247 s for commit `b30566c` and 0.4931 s for this scanner. Median CPU time changed from 2.9924 s to 2.8047 s. Both output tables matched, covering 1,140,271 user-days and 28,014 campaign-days. On the public million-event input, twenty alternating pairs measured 88.76 ms and 89.21 ms wall time, and 305.13 ms and 290.31 ms CPU time. A sanitizer test compared 1.2 million timestamp inputs with the prior decoder.
 
 Generate the larger workload after `make check-dev`.
 

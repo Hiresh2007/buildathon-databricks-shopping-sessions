@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -115,6 +116,18 @@ template <std::size_t N> bool fields(Text line, std::array<Text, N>& out) {
     return true;
 }
 
+// Common-width rows use constant-size field readers. The generic callback
+// handles every other width, including long records and the scalar scanner.
+template <std::size_t Columns> struct FixedWidthRowTag {};
+template <std::size_t Columns, class General, class Direct>
+struct FixedWidthRows : FixedWidthRowTag<Columns> {
+    General &general;
+    Direct &common;
+    FixedWidthRows(General &general, Direct &common) : general(general), common(common) {}
+    void operator()(const std::array<Text, Columns> &row) {
+        general(row);
+    }
+};
 #if defined(__SSE2__)
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
@@ -228,102 +241,158 @@ __attribute__((always_inline)) inline void vector_records(Text bytes, F& consume
     }
     if (first != block || column) field(block, true);
 }
-// Verify the CSV structure for a short run of complete lines before decoding
-// it. Each structural index stores a field end and whether its quotes must be
-// stripped. Newlines must occur at every Nth field, and every separator must
-// fall outside a quoted field. Unusual or malformed runs use the row scanner.
+// Validate each row's delimiter and quote masks before reusing its field offsets.
 template <std::size_t N, auto scan_block, typename F>
-__attribute__((always_inline)) inline void batched_records(Text bytes, F& consume) {
-    constexpr std::size_t max_bytes = 1024;
-    constexpr unsigned quoted = 0x8000;
-    std::array<std::uint16_t, max_bytes> field_ends;
+__attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
+    // Keep complete records together. A row beyond 128 bytes uses the general scanner.
+    constexpr unsigned batch_size = 4096, cache_size = N == 7 ? 8192 : N == 4 ? 1024 : 128;
+    struct Entry {
+        std::uint64_t ends_low, ends_high, quotes_low, quotes_high;
+        std::uint8_t begin[N], length[N];
+        bool valid_layout, fixed_width;
+    };
+    // Each scanner instantiation has its own thread-local cache and callback geometry.
+    static thread_local std::array<Entry, cache_size> cache{};
     std::array<Text, N> fields;
-    auto is_separator = [](char c) { return c == ',' || c == '\n'; };
     while (!bytes.empty()) {
-        auto end = bytes.rfind('\n', std::min(bytes.size(), max_bytes) - 1);
-        if (end == Text::npos) {
-            end = bytes.find('\n');
-            const auto length = end == Text::npos ? bytes.size() : end + 1;
-            vector_records<N, scan_block>(bytes.substr(0, length), consume);
-            bytes.remove_prefix(length);
+        auto newline_at = bytes.rfind('\n', std::min<std::size_t>(batch_size, bytes.size()) - 1);
+        if (newline_at == Text::npos) {
+            newline_at = bytes.find('\n');
+            auto n = newline_at == Text::npos ? bytes.size() : newline_at + 1;
+            vector_records<N, scan_block>(bytes.substr(0, n), emit);
+            bytes.remove_prefix(n);
             continue;
         }
-        const auto batch = bytes.substr(0, end + 1);
-        bytes.remove_prefix(batch.size());
-        unsigned field_count = 0, row_columns = 0;
-        bool malformed = false, inside_quotes = false;
-        for (std::size_t offset = 0; offset < batch.size(); offset += 64) {
-            const auto length = std::min<std::size_t>(64, batch.size() - offset);
-            const char* source = batch.data() + offset;
-            char tail[64]{};
-            const char* scan = source;
-            if (length < 64) {
-                std::memcpy(tail, source, length);
-                scan = tail;
-            }
-            auto marks = scan_block(scan);
-            const bool left = !offset || is_separator(source[-1]);
-            const bool right = offset + length == batch.size() || is_separator(source[length]);
-            const auto edges = (marks.endings << 1) | left | (marks.endings >> 1)
-                             | (std::uint64_t(right) << (length - 1));
-            auto parity = marks.quotes;
-            parity ^= parity << 1;
-            parity ^= parity << 2;
-            parity ^= parity << 4;
-            parity ^= parity << 8;
-            parity ^= parity << 16;
-            parity ^= parity << 32;
-            if (inside_quotes) parity = ~parity;
-            inside_quotes = (parity >> (length - 1)) & 1;
-            if ((marks.quotes & ~edges) || (parity & marks.endings)) {
-                malformed = true;
-                break;
-            }
-            auto remaining = marks.endings;
-            for (auto lines = marks.newlines; lines; lines &= lines - 1) {
-                const auto boundary = lines & -lines;
-                const auto through = boundary | (boundary - 1);
-                row_columns += __builtin_popcountll(remaining & through);
-                if (row_columns != N) {
-                    malformed = true;
-                    break;
-                }
-                remaining &= ~through;
-                row_columns = 0;
-            }
-            if (malformed) break;
-            row_columns += __builtin_popcountll(remaining);
-            const auto closing = (marks.quotes << 1) | std::uint64_t(offset && source[-1] == '"');
-            for (auto separators = marks.endings; separators; separators &= separators - 1) {
-                const unsigned bit = __builtin_ctzll(separators);
-                field_ends[field_count++] = std::uint16_t((offset + bit) | (((closing >> bit) & 1) * quoted));
+        auto part = bytes.substr(0, newline_at + 1);
+        bytes.remove_prefix(part.size());
+        std::array<Separators, batch_size / 64 + 3> blocks;
+        unsigned count = 0;
+        for (unsigned i = 0; i < part.size(); i += 64) {
+            if (part.size() - i >= 64)
+                blocks[count++] = scan_block(part.data() + i);
+            else {
+                char tail[64]{};
+                std::memcpy(tail, part.data() + i, part.size() - i);
+                blocks[count++] = scan_block(tail);
             }
         }
-        if (malformed) {
-            vector_records<N, scan_block>(batch, consume);
-            continue;
-        }
+        blocks[count] = blocks[count + 1] = blocks[count + 2] = Separators{};
         unsigned begin = 0;
-        for (unsigned i = 0; i < field_count; i += N) {
+        auto low_bits = [](unsigned n) { return n >= 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; };
+        auto rotate = [](std::uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); };
+        while (begin < part.size()) {
+            const auto *s = blocks.data() + begin / 64;
+            auto shift = begin & 63;
+            auto join = [&](std::uint64_t l, std::uint64_t hash) {
+                return (l >> shift) | (shift ? (hash << (64 - shift)) : 0);
+            };
+            auto newline = join(s[0].newlines, s[1].newlines);
+            unsigned row_size = 0;
+            if (newline)
+                row_size = 1 + __builtin_ctzll(newline);
+            else {
+                newline = join(s[1].newlines, s[2].newlines);
+                if (newline)
+                    row_size = 65 + __builtin_ctzll(newline);
+            }
+            if (!row_size) {
+                auto end = part.find('\n', begin + 128);
+                row_size = static_cast<unsigned>(end + 1 - begin);
+                vector_records<N, scan_block>(part.substr(begin, row_size), emit);
+                begin += row_size;
+                continue;
+            }
+            const auto ends_low = join(s[0].endings, s[1].endings) & low_bits(row_size);
+            const auto quotes_low = join(s[0].quotes, s[1].quotes) & low_bits(row_size);
+            auto ends_high = UINT64_C(0), quotes_high = UINT64_C(0);
+            if (row_size > 64) {
+                auto mask = low_bits(row_size - 64);
+                ends_high = join(s[1].endings, s[2].endings) & mask;
+                quotes_high = join(s[1].quotes, s[2].quotes) & mask;
+            }
+            auto hash = (ends_low ^ rotate(quotes_low, 17)) * UINT64_C(0x9e3779b97f4a7c15) +
+                        (ends_high ^ rotate(quotes_high, 27)) * UINT64_C(0xbf58476d1ce4e5b9);
+            auto slot = N == 4 ? (hash >> (64 - __builtin_ctz(cache_size)))
+                               : ((hash ^ (hash >> 29)) & (cache_size - 1));
+            auto &entry = cache[slot];
+            auto row = part.data() + begin;
+            begin += row_size;
+            // Check all four masks, including the newline. A hash collision only replaces an entry.
+            if (entry.ends_low != ends_low || entry.ends_high != ends_high ||
+                entry.quotes_low != quotes_low || entry.quotes_high != quotes_high) {
+                entry.ends_low = ends_low;
+                entry.ends_high = ends_high;
+                entry.quotes_low = quotes_low;
+                entry.quotes_high = quotes_high;
+                entry.valid_layout = false;
+                if (__builtin_popcountll(ends_low) + __builtin_popcountll(ends_high) != N)
+                    continue;
+                // Reconstruct exactly two quotes around each quoted field. Equality with
+                // the input masks also rejects stray quotes inside unquoted fields.
+                auto a = ends_low, b = ends_high;
+                unsigned first = 0;
+                std::uint64_t expected_quotes[2]{};
+                bool valid = true;
+                for (unsigned j = 0; j < N; j++) {
+                    unsigned end;
+                    if (a) {
+                        end = __builtin_ctzll(a);
+                        a &= a - 1;
+                    } else {
+                        end = 64 + __builtin_ctzll(b);
+                        b &= b - 1;
+                    }
+                    bool quote = row[first] == '"';
+                    if (quote) {
+                        if (end - first < 2) {
+                            valid = false;
+                            break;
+                        }
+                        expected_quotes[first >> 6] |= UINT64_C(1) << (first & 63);
+                        expected_quotes[(end - 1) >> 6] |= UINT64_C(1) << ((end - 1) & 63);
+                    }
+                    entry.begin[j] = first + quote;
+                    entry.length[j] = end - first - 2 * quote;
+                    first = end + 1;
+                }
+                entry.valid_layout =
+                    valid && expected_quotes[0] == quotes_low && expected_quotes[1] == quotes_high;
+                if constexpr (N == 4 && std::is_base_of_v<FixedWidthRowTag<4>, F>)
+                    entry.fixed_width =
+                        entry.valid_layout && (entry.length[0] == 8 || entry.length[0] == 9) &&
+                        (entry.length[1] == 8 || entry.length[1] == 9) &&
+                        (entry.length[3] == 13 || entry.length[3] == 20 || entry.length[3] == 25);
+                if constexpr (N == 7 && std::is_base_of_v<FixedWidthRowTag<7>, F>)
+                    entry.fixed_width =
+                        entry.valid_layout && entry.length[0] == 9 && entry.length[1] == 9 &&
+                        entry.length[3] == 20 &&
+                        (entry.length[2] == 20 || entry.length[2] == 25 || entry.length[2] == 13) &&
+                        (entry.length[4] == 4 || entry.length[4] == 8);
+            }
+            if (entry.valid_layout) {
+                if constexpr (std::is_base_of_v<FixedWidthRowTag<N>, F>)
+                    if (entry.fixed_width) {
+                        emit.common(row, entry);
+                        continue;
+                    }
+
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
 #pragma GCC unroll 8
 #endif
-            for (unsigned j = 0; j < N; ++j) {
-                const unsigned encoded = field_ends[i + j];
-                const unsigned end = encoded & (quoted - 1), trim = encoded >> 15;
-                fields[j] = Text(batch.data() + begin + trim, end - begin - 2 * trim);
-                begin = end + 1;
+                for (unsigned j = 0; j < N; j++)
+                    fields[j] = {row + entry.begin[j], entry.length[j]};
+                emit(fields);
             }
-            consume(fields);
         }
     }
 }
+
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 template <std::size_t N, typename F>
 __attribute__((target("avx2"))) void records_avx2(Text bytes, F& consume) {
-    batched_records<N, scan64_avx2>(bytes, consume);
+    cached_records<N, scan64_avx2>(bytes, consume);
 }
 #endif
 #endif
@@ -336,7 +405,7 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
         return;
     }
 #endif
-    batched_records<N, scan64>(bytes, consume);
+    cached_records<N, scan64>(bytes, consume);
 #else
     each_line(bytes, [&](Text line) {
         std::array<Text, N> row;
@@ -345,6 +414,13 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
 #endif
 }
 
+// Combine adjacent digit pairs, then four-digit groups, in one word.
+inline std::uint64_t eight_decimal_digits(std::uint64_t bytes) {
+    bytes &= UINT64_C(0x0f0f0f0f0f0f0f0f);
+    bytes = (bytes * 10 + (bytes >> 8)) & UINT64_C(0x00ff00ff00ff00ff);
+    bytes = (bytes * 100 + (bytes >> 16)) & UINT64_C(0x0000ffff0000ffff);
+    return (bytes & 65535) * 10000 + (bytes >> 32);
+}
 inline std::int64_t number(Text value, std::int64_t limit) {
     while (value.size() > 1 && value.front() == '0') value.remove_prefix(1);
     // Nineteen decimal digits always fit in uint64_t; range-check once after parsing.
@@ -358,10 +434,7 @@ inline std::int64_t number(Text value, std::int64_t limit) {
 #endif
         if (((digits - UINT64_C(0x3030303030303030)) | (digits + UINT64_C(0x4646464646464646)))
             & UINT64_C(0x8080808080808080)) return -1;
-        digits &= UINT64_C(0x0f0f0f0f0f0f0f0f);
-        digits = (digits * 10 + (digits >> 8)) & UINT64_C(0x00ff00ff00ff00ff);
-        digits = (digits * 100 + (digits >> 16)) & UINT64_C(0x0000ffff0000ffff);
-        n = n * 100000000 + (digits & 65535) * 10000 + (digits >> 32);
+        n = n * 100000000 + eight_decimal_digits(digits);
         value.remove_prefix(8);
     }
     for (char ch : value) {
@@ -442,18 +515,16 @@ inline Millis ingest_time(Text value) {
     return midnight(p) + seconds * 1000;
 }
 
-inline Millis timestamp(Text value) {
-    if (value.size() < 5 || value[4] != '-') {
-        auto n = number(value, INT64_MAX);
-        return n < 0 ? invalid_time : n;
-    }
-    if (value.size() != 20 && value.size() != 25) return invalid_time;
-    const auto* p = value.data();
+// ISO records have one of two exact widths. The F1 ingestion date may supply a
+// midnight already computed for the same ten calendar bytes.
+template <unsigned Width>
+__attribute__((always_inline)) inline Millis iso_timestamp(const char *p, const char *arrival = nullptr,
+                                                           Millis arrival_day = 0) {
     if (p[10] != 'T') return invalid_time;
     const int seconds = daytime<true>(p + 11);
     if (seconds < 0) return invalid_time;
     int offset = 0;
-    if (value.size() == 20) {
+    if constexpr (Width == 20) {
         if (p[19] != 'Z') return invalid_time;
     } else {
         if ((p[19] != '+' && p[19] != '-') || p[22] != ':') return invalid_time;
@@ -461,7 +532,48 @@ inline Millis timestamp(Text value) {
         if (h > 23 || m > 59) return invalid_time;
         offset = static_cast<int>(h * 60 + m) * (p[19] == '+' ? 1 : -1);
     }
-    const auto day = midnight(p);
+    const auto day = arrival && std::memcmp(p, arrival, 10) == 0 ? arrival_day : midnight(p);
     if (day == invalid_time) return day;
     return day + (seconds - offset * 60) * 1000LL;
+}
+
+inline Millis timestamp(Text value) {
+    if (value.size() < 5 || value[4] != '-') {
+        auto n = number(value, INT64_MAX);
+        return n < 0 ? invalid_time : n;
+    }
+    if (value.size() == 20)
+        return iso_timestamp<20>(value.data());
+    if (value.size() == 25)
+        return iso_timestamp<25>(value.data());
+    return invalid_time;
+}
+
+// Two overlapping eight-byte reads cover exactly thirteen decimal places.
+inline Millis thirteen_decimal_digits(const char *p) {
+    std::uint64_t first, last;
+    std::memcpy(&first, p, 8);
+    std::memcpy(&last, p + 5, 8);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    first = __builtin_bswap64(first);
+    last = __builtin_bswap64(last);
+#endif
+    constexpr std::uint64_t zeros = UINT64_C(0x3030303030303030), sixes = UINT64_C(0x4646464646464646),
+                            high = UINT64_C(0x8080808080808080);
+    if ((((first - zeros) | (first + sixes) | (last - zeros) | (last + sixes)) & high) != 0)
+        return invalid_time;
+    return eight_decimal_digits(first << 24) * UINT64_C(100000000) + eight_decimal_digits(last);
+}
+template <unsigned Width>
+__attribute__((always_inline)) inline Millis timestamp_at_width(const char *p, const char *arrival = nullptr,
+                                                                Millis arrival_day = 0) {
+    if constexpr (Width == 13)
+        return thirteen_decimal_digits(p);
+    else {
+        if (p[4] == '-')
+            return iso_timestamp<Width>(p, arrival, arrival_day);
+        // F3 timestamps allow leading zeroes, including at ISO-sized widths.
+        auto numeric = number(Text(p, Width), INT64_MAX);
+        return numeric < 0 ? invalid_time : numeric;
+    }
 }
