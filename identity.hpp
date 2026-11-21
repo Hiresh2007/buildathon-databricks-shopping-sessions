@@ -54,6 +54,11 @@ struct NameHash { std::size_t operator()(Name name) const { return name.hash(); 
 
 struct NamePool {
     std::deque<Text> external_names;
+    __attribute__((noinline)) Name store_external(Text text) {
+        external_names.push_back(text);
+        return {Name::external | reinterpret_cast<std::uintptr_t>(&external_names.back())};
+    }
+
     Name get(Text text) {
         if (text.size() == 9 || text.size() == 8) {
             static constexpr auto prefixes = [] {
@@ -73,7 +78,6 @@ struct NamePool {
             if (!(bytes & ~Name::ascii) && first < 128 && (first || !has_prefix))
                 return {bytes | prefixes[first]};
         }
-        external_names.push_back(text);
-        return {Name::external | reinterpret_cast<std::uintptr_t>(&external_names.back())};
+        return store_external(text);
     }
 };

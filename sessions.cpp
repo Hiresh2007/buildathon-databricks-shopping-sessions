@@ -533,10 +533,6 @@ struct CampaignTotals {
         auto length = std::int64_t(last) - first + 1;
         if (length > 0 && std::uint64_t(length) <= 500000 / n) dense.resize(n * length);
     }
-    Totals& get(int id, int day) {
-        if (dense.empty()) return sparse[{id, day}];
-        return dense[std::size_t(day - first_day) * campaigns + id];
-    }
 };
 
 // In a narrow window the high 32 bits order events by their exact timestamp.
@@ -701,6 +697,7 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
         });
         std::size_t ei = activity.event_begin, left = activity.click_begin, right = left;
         int user_day = 0, sessions = 0;
+        Totals* campaign_day = nullptr;
         std::int64_t daily_events = 0, daily_revenue = 0;
         auto write_day = [&] {
             int best = -1;
@@ -725,6 +722,8 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
                 sessions = 0;
                 daily_events = daily_revenue = 0;
             }
+            if (!sessions && !totals.dense.empty())
+                campaign_day = totals.dense.data() + std::size_t(day - totals.first_day) * totals.campaigns;
             user_day = day;
             ++sessions;
             auto first = ei;
@@ -764,11 +763,15 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
                 }
             }
             int credited = left == right ? 0 : clicks[right - 1].campaign;
-            auto& metrics = totals.get(credited, day);
+            auto& metrics = campaign_day ? campaign_day[credited] : totals.sparse[{credited, day}];
             ++metrics.sessions;
             metrics.revenue += revenue;
             metrics.purchasing += revenue > 0;
-            for (int campaign : active) ++totals.get(campaign, day).assists;
+            if (campaign_day) {
+                for (int campaign : active) ++campaign_day[campaign].assists;
+            } else {
+                for (int campaign : active) ++totals.sparse[{campaign, day}].assists;
+            }
         }
         write_day();
         for (int campaign : active) click_counts[campaign] = 0;

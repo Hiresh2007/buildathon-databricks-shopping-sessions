@@ -171,6 +171,9 @@ struct FixedWidthRows : FixedWidthRowTag<Columns> {
 #include <immintrin.h>
 #elif defined(__ARM_NEON)
 #include <arm_neon.h>
+#if defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+#endif
 #endif
 
 #if defined(__SSE2__) || defined(__ARM_NEON)
@@ -219,6 +222,17 @@ __attribute__((target("avx2"))) inline Separators scan64_avx2(const char* bytes)
     }
     return result;
 }
+#if defined(__AVX2__)
+inline Separators scan32_avx2(const char* bytes) {
+    const auto input = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(bytes));
+    const auto lines = _mm256_cmpeq_epi8(input, _mm256_set1_epi8('\n'));
+    const auto commas = _mm256_cmpeq_epi8(input, _mm256_set1_epi8(','));
+    const auto quotes = _mm256_cmpeq_epi8(input, _mm256_set1_epi8('"'));
+    return {static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(commas, lines))),
+            static_cast<std::uint32_t>(_mm256_movemask_epi8(quotes)),
+            static_cast<std::uint32_t>(_mm256_movemask_epi8(lines))};
+}
+#endif
 #endif
 #endif
 
@@ -293,16 +307,25 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
     // Each scanner instantiation has its own thread-local cache and callback geometry.
     static thread_local std::array<Entry, cache_size> cache{};
     std::array<Text, N> fields;
-    auto rotate = [](std::uint64_t value, unsigned count) {
-        return (value << count) | (value >> (64 - count));
-    };
     auto visit =
         [&](const char *row, std::uint64_t ends_low, std::uint64_t quotes_low, std::uint64_t ends_high,
             std::uint64_t quotes_high) __attribute__((always_inline)) {
-            auto hash = (ends_low ^ rotate(quotes_low, 17)) * UINT64_C(0x9e3779b97f4a7c15) +
-                        (ends_high ^ rotate(quotes_high, 27)) * UINT64_C(0xbf58476d1ce4e5b9);
-            auto slot = N == 4 ? (hash >> (64 - __builtin_ctz(cache_size)))
-                               : ((hash ^ (hash >> 29)) & (cache_size - 1));
+            // The cache always compares every original delimiter and quote mask.
+#if defined(__SSE4_2__)
+            const auto hash = _mm_crc32_u64(ends_high ^ quotes_high, ends_low ^ quotes_low);
+            const auto slot = hash & (cache_size - 1);
+#elif defined(__ARM_FEATURE_CRC32)
+            const auto hash = __crc32cd(static_cast<unsigned>(ends_high ^ quotes_high), ends_low ^ quotes_low);
+            const auto slot = hash & (cache_size - 1);
+#else
+            auto rotate = [](std::uint64_t value, unsigned count) {
+                return (value << count) | (value >> (64 - count));
+            };
+            const auto hash = (ends_low ^ rotate(quotes_low, 17)) * UINT64_C(0x9e3779b97f4a7c15) +
+                              (ends_high ^ rotate(quotes_high, 27)) * UINT64_C(0xbf58476d1ce4e5b9);
+            const auto slot = N == 4 ? (hash >> (64 - __builtin_ctz(cache_size)))
+                                     : ((hash ^ (hash >> 29)) & (cache_size - 1));
+#endif
             auto &entry = cache[slot];
             // Check all four masks, including the newline. A hash collision only replaces an entry.
             if (entry.ends_low != ends_low || entry.ends_high != ends_high ||
@@ -375,28 +398,40 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
         };
 #if defined(__x86_64__) || defined(__i386__)
     // Read from each record start. The first newline bounds both the row and its shape-cache key.
-    auto low_bits = [](unsigned n) { return n >= 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; };
+    auto scan_until_newline = [](const char* row, auto short_records) {
+#if defined(__AVX2__)
+        // Clicks, links and the trailing half of an event usually end in the first 32 bytes.
+        if constexpr (decltype(short_records)::value) {
+            const auto first = scan32_avx2(row);
+            if (first.newlines) return first;
+            const auto next = scan32_avx2(row + 32);
+            return Separators{first.endings | (next.endings << 32),
+                              first.quotes | (next.quotes << 32), next.newlines << 32};
+        }
+#endif
+        return scan_block(row);
+    };
     while (bytes.size() >= 128) {
         const char *row = bytes.data();
-        auto first = scan_block(row);
+        const auto first = scan_until_newline(row, std::bool_constant<N != 7>{});
         unsigned row_size = 0;
         std::uint64_t ends_low, quotes_low, ends_high = 0, quotes_high = 0;
         if (first.newlines) {
             row_size = 1 + __builtin_ctzll(first.newlines);
-            auto mask = low_bits(row_size);
+            const auto mask = first.newlines ^ (first.newlines - 1);
             ends_low = first.endings & mask;
             quotes_low = first.quotes & mask;
         } else {
-            auto second = scan_block(row + 64);
+            const auto second = scan_until_newline(row + 64, std::true_type{});
             if (!second.newlines) {
-                auto following = bytes.find('\n', 128);
-                auto length = following == Text::npos ? bytes.size() : following + 1;
+                const auto following = bytes.find('\n', 128);
+                const auto length = following == Text::npos ? bytes.size() : following + 1;
                 vector_records<N, scan_block>(bytes.substr(0, length), emit);
                 bytes.remove_prefix(length);
                 continue;
             }
             row_size = 65 + __builtin_ctzll(second.newlines);
-            auto mask = low_bits(row_size - 64);
+            const auto mask = second.newlines ^ (second.newlines - 1);
             ends_low = first.endings;
             quotes_low = first.quotes;
             ends_high = second.endings & mask;
@@ -538,39 +573,65 @@ inline int unix_day(int y, int m, int d) {
 constexpr Millis invalid_time = INT64_MIN;
 
 inline unsigned digit_pair(const char* p) {
-    static const auto decoded = [] {
-        std::array<unsigned char, 65536> table;
-        table.fill(255);
-        for (unsigned a = 0; a < 10; ++a) for (unsigned b = 0; b < 10; ++b)
-            table[('0' + a) | (('0' + b) << 8)] = 10 * a + b;
-        return table;
+    // Storing value + 1 leaves zero as the default for all non-ASCII-digit pairs.
+    static constexpr auto table = [] {
+        std::array<unsigned char, 65536> encoded{};
+        for (unsigned a = 0; a < 10; ++a)
+            for (unsigned b = 0; b < 10; ++b)
+                encoded[('0' + a) | (('0' + b) << 8)] = static_cast<unsigned char>(1 + 10 * a + b);
+        return encoded;
     }();
-    return decoded[static_cast<unsigned char>(p[0]) | (static_cast<unsigned char>(p[1]) << 8)];
+    const unsigned key = static_cast<unsigned char>(p[0]) | (static_cast<unsigned char>(p[1]) << 8);
+    return static_cast<unsigned char>(table[key] - 1);
 }
 
-inline Millis midnight(const char* p) {
-    struct Date { std::uint64_t prefix = 0; Millis millis = invalid_time; };
-    static thread_local std::array<Date, 32> dates;
-    const auto d = digit_pair(p + 8);
-    if (d == 0 || d > 31) return invalid_time;
+struct CachedDate {
+    std::uint64_t prefix = 0;
+    Millis midnight = invalid_time;
+};
+
+__attribute__((noinline)) inline Millis cache_midnight(const char* p, unsigned day, std::uint64_t prefix,
+                                                       CachedDate& date) {
+    if (p[4] != '-' || p[7] != '-') return invalid_time;
+    const auto century = digit_pair(p), y = digit_pair(p + 2), month = digit_pair(p + 5);
+    const auto year = century * 100 + y;
+    if (century > 99 || y > 99 || !year || !month || month > 12) return invalid_time;
+    constexpr unsigned days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    const auto leap = month == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    if (day > days[month - 1] + leap) return invalid_time;
+    date = {prefix, unix_day(year, month, day) * day_ms};
+    return date.midnight;
+}
+
+__attribute__((always_inline)) inline Millis midnight(const char* p) {
+    static thread_local std::array<CachedDate, 32> dates;
+    const auto day = digit_pair(p + 8);
+    if (!day || day > 31) return invalid_time;
     std::uint64_t prefix;
     std::memcpy(&prefix, p, 8);
-    auto& date = dates[d];
-    if (date.prefix == prefix) return date.millis;
-    if (p[4] != '-' || p[7] != '-') return invalid_time;
-    const auto century = digit_pair(p), y = digit_pair(p + 2), m = digit_pair(p + 5);
-    const auto year = century * 100 + y;
-    if (century > 99 || y > 99 || year == 0 || m == 0 || m > 12) return invalid_time;
-    constexpr unsigned days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
-    const auto leap = m == 2 && year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    if (d > days[m - 1] + leap) return invalid_time;
-    date = {prefix, unix_day(year, m, d) * day_ms};
-    return date.millis;
+    auto& date = dates[day];
+    return date.prefix == prefix ? date.midnight : cache_midnight(p, day, prefix, date);
 }
 
 // Hours, minutes and seconds start at byte offsets 0, 3 and 6. Decode all
 // three digit pairs in one word. Ingestion times are guaranteed to be F1.
 template<bool validate> inline int daytime(const char* p) {
+#if defined(__SSE4_1__) && defined(__SSSE3__)
+    const auto bytes = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(p));
+    const auto raw = _mm_sub_epi8(bytes, _mm_set1_epi8('0'));
+    const auto digits = _mm_shuffle_epi8(raw, _mm_setr_epi8(0,1,3,4,6,7,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1));
+    const auto pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+    if constexpr (validate) {
+        const auto punctuation = _mm_and_si128(bytes, _mm_set_epi64x(0, UINT64_C(0x0000ff0000ff0000)));
+        if (_mm_cvtsi128_si64(punctuation) != UINT64_C(0x00003a00003a0000)) return -1;
+        const auto bad_digits = _mm_subs_epu8(digits, _mm_set1_epi8(9));
+        if (!_mm_testz_si128(bad_digits, bad_digits)) return -1;
+        const auto upper = _mm_setr_epi16(23,59,59,0,0,0,0,0);
+        if (_mm_movemask_epi8(_mm_cmpgt_epi16(pairs, upper))) return -1;
+    }
+    const auto parts = _mm_madd_epi16(pairs, _mm_setr_epi16(3600,60,1,0,0,0,0,0));
+    return _mm_cvtsi128_si32(parts) + _mm_extract_epi32(parts, 1);
+#else
     std::uint64_t bytes;
     std::memcpy(&bytes, p, 8);
 #if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -588,6 +649,7 @@ template<bool validate> inline int daytime(const char* p) {
             hour > 23 || minute > 59 || second > 59) return -1;
     }
     return (hour * 60 + minute) * 60 + second;
+#endif
 }
 
 inline Millis ingest_time(Text value) {
