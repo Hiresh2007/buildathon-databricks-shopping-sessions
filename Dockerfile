@@ -13,4 +13,4 @@ COPY --from=build /src/sessions .
 COPY run.py .
 ENV PYTHONDONTWRITEBYTECODE=1
 USER 1000:1000
-CMD ["python", "/app/run.py"]
+CMD ["/app/sessions"]

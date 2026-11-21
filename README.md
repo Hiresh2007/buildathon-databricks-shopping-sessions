@@ -9,10 +9,10 @@ Use a C++17 compiler, Python 3.10 or later, Make, curl, and unzip. The million-e
 ```sh
 make fixtures
 make check-dev
-.venv/bin/python run.py /path/to/input /path/to/output
+./sessions /path/to/input /path/to/output
 ```
 
-The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The runner accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. The runner uses up to eight workers from `NCPU`. It writes directly into the two output directories.
+The Make targets fetch the official fixtures, generator, and expected outputs into `.cache/`. The native runner reads the manifest with Apache Arrow’s JSON parser and accepts positional input and output paths or the scorer's `DATA_DIR` and `OUTPUT_DIR`. The existing Python launcher handles additional ISO 8601 window representations. The runner uses up to eight workers from `NCPU`. It writes directly into the two output directories.
 
 ## Run the competition image
 
@@ -41,11 +41,13 @@ The comparison below used an Apple M4 with eight workers. Each cell is the media
 | 20M events, 5M clicks, seed 71 | 3.874 s | 2.328 s | 39.9% |
 | 20M events, 5M clicks, seed 1049 | 3.915 s | 2.536 s | 35.2% |
 
+Using the native executable as the entrypoint also saved 43 ms at 1M events and 23 ms at 10M events in paired warm runs on the M4. The organizer’s comparator found identical outputs at both sizes. On the 10M input it compared 1,134,699 user-days and 28,014 campaign-days.
+
 An independent Python implementation verified a 40,000-event case with a wide date range, more than 255 purchase categories and mixed-width Unicode identifiers. It also verified a dense-event case with exact 30-minute boundaries, day transitions and tied click times. The reader uses AVX2, SSE2 or NEON when supported, with a scalar implementation for other architectures.
 
 Generate the larger workload after `make check-dev`.
 
 ```sh
 .cache/generator/target/release/generate --seed 71 --events 20000000 --clicks 5000000 --output .cache/bench
-time .venv/bin/python run.py .cache/bench .cache/bench-output
+time ./sessions .cache/bench .cache/bench-output
 ```

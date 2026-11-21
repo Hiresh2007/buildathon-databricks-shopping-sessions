@@ -1,8 +1,13 @@
 #include "parquet_output.hpp"
+#include <arrow/json/object_parser.h>
 #include <atomic>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <optional>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 
 constexpr std::size_t shards = 64;
@@ -523,15 +528,50 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
     }
 }
 
+const char* environment(const char* key, const char* fallback) {
+    const char* value = std::getenv(key);
+    return value ? value : fallback;
+}
+
+// The native path uses the same validated civil-time arithmetic as event rows.
+// The compatibility launcher also accepts less common ISO 8601 representations.
+std::optional<std::pair<Millis, Millis>> manifest_window(const fs::path& data) {
+    std::ifstream input(data / "manifest.json");
+    if (!input) throw std::runtime_error("cannot open " + (data / "manifest.json").string());
+    std::string contents{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    arrow::json::internal::ObjectParser object;
+    if (!object.Parse(contents).ok()) return std::nullopt;
+    auto start = object.GetString("window_start");
+    auto end = object.GetString("window_end");
+    if (!start.ok() || !end.ok()) return std::nullopt;
+    auto parse_iso = [](Text s) {
+        return (s.size() == 20 || s.size() == 25) && s[4] == '-' ? timestamp(s) : invalid_time;
+    };
+    Millis first = parse_iso(*start), last = parse_iso(*end);
+    if (first == invalid_time || last == invalid_time) return std::nullopt;
+    return std::pair{first, last};
+}
+
 int main(int argc, char** argv) {
-    if (argc != 6) {
-        std::cerr << "usage: sessions DATA OUTPUT WINDOW_START_MS WINDOW_END_MS THREADS\n";
+    if (argc != 1 && argc != 2 && argc != 3 && argc != 6) {
+        std::cerr << "usage: sessions [DATA [OUTPUT [WINDOW_START_MS WINDOW_END_MS THREADS]]]\n";
         return 2;
     }
     try {
-        fs::path data = argv[1], output = argv[2];
-        Millis start = std::stoll(argv[3]), end = std::stoll(argv[4]);
-        threads = std::clamp(std::stoi(argv[5]), 1, 8);
+        fs::path data = argc >= 2 ? argv[1] : environment("DATA_DIR", "/data");
+        fs::path output = argc >= 3 ? argv[2] : environment("OUTPUT_DIR", "/output");
+        Millis start, end;
+        if (argc == 6) {
+            start = std::stoll(argv[3]);
+            end = std::stoll(argv[4]);
+        } else if (auto window = manifest_window(data)) {
+            std::tie(start, end) = *window;
+        } else {
+            auto script = fs::canonical(argv[0]).parent_path() / "run.py";
+            execlp("python3", "python3", script.c_str(), data.c_str(), output.c_str(), nullptr);
+            throw std::runtime_error("cannot start manifest compatibility launcher");
+        }
+        threads = std::clamp(std::stoi(argc == 6 ? argv[5] : environment("NCPU", "8")), 1, 8);
         Files links(data / "links"), products(data / "products.csv"), campaigns(data / "campaigns.csv");
         Files event_files(data / "events"), click_files(data / "clicks");
         std::optional<People> people;

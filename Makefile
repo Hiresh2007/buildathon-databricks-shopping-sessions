@@ -8,10 +8,10 @@ PY := .venv/bin/python
 
 .PHONY: fixtures check-dev
 fixtures: sessions .venv/.installed $(KIT)/scripts/run_fixtures.py
-	$(PY) $(KIT)/scripts/run_fixtures.py $(KIT)/fixtures -- $(PY) run.py
+	$(PY) $(KIT)/scripts/run_fixtures.py $(KIT)/fixtures -- ./sessions
 
 check-dev: sessions .venv/.installed $(KIT)/scripts/run_fixtures.py .cache/dev/.generated .cache/dev-answer/user_daily.csv
-	$(PY) run.py .cache/dev .cache/dev-output
+	./sessions .cache/dev .cache/dev-output
 	$(PY) $(KIT)/scripts/compare.py .cache/dev-output .cache/dev-answer
 
 sessions: sessions.cpp input.hpp identity.hpp parquet_output.hpp build.py .venv/.installed
