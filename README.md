@@ -60,6 +60,10 @@ The parallel identity graph matched commit `2d4625f` on an independent 20-millio
 
 The eight- and nine-byte identifier encoding round-tripped 103,072 ASCII and binary strings and matched one million bytewise ordering and equality comparisons. Both output tables matched the organizer’s million-event answers and the previous implementation on an independent 10-million-event input (seed 76129).
 
+The CSV scanner validates batches of complete rows and indexes their field boundaries. It uses the existing row scanner on malformed batches and long rows. For windows and purchase categories that fit the packed representation, sorting an eight-byte event key orders it by timestamp and preserves the purchase data. Wider inputs retain their full times and categories.
+
+On the Apple M4, alternating ten warm measured runs per build on seed 76129 (10M events, 2.5M clicks) gave medians of 0.8822 s for `3e79282` and 0.8252 s for this pipeline. CPU time fell from 3.3992 s to 3.2198 s. All rows matched. A sanitizer build matched an independent CSV decoder on 210,000 generated lines across the link, click and event schemas, including malformed rows, vector boundaries and unterminated final lines.
+
 Generate the larger workload after `make check-dev`.
 
 ```sh

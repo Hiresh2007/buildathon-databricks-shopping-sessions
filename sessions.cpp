@@ -8,6 +8,7 @@
 #include <optional>
 #include <thread>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 
 constexpr std::size_t shards = 64;
@@ -410,11 +411,24 @@ struct CampaignTotals {
     }
 };
 
-struct TimedEvent { Millis ts; int price, category; };
+// In a narrow window the high 32 bits order events by their exact timestamp.
+// The low 32 bits preserve purchase amount and category, including at ties.
+struct WideEvent {
+    Millis ts;
+    int price, category;
+};
+template <bool Narrow> using EventTimeRow = std::conditional_t<Narrow, std::uint64_t, WideEvent>;
+template <bool Narrow> Millis row_time(const EventTimeRow<Narrow>& row, Millis epoch) {
+    if constexpr (Narrow)
+        return epoch + static_cast<std::uint32_t>(row >> 32);
+    else
+        return row.ts;
+}
 
 // A half-hour bin forms one connected piece of a session. Only its earliest
 // and latest event can determine whether it joins the adjacent nonempty bin.
-struct SessionOrder {
+template <bool Narrow> struct SessionOrder {
+    using TimedEvent = EventTimeRow<Narrow>;
     struct Bin { std::size_t count = 0, begin, cursor, earliest, latest; };
     Millis origin;
     std::vector<Bin> bins;
@@ -425,12 +439,17 @@ struct SessionOrder {
     }
     void arrange(std::vector<TimedEvent>& data, std::size_t begin, std::size_t end) {
         auto n = end - begin;
+        auto event_time = [&](const TimedEvent& e) { return row_time<Narrow>(e, origin - week_ms); };
         if (bins.empty() || n < 128 || n * 4 < bins.size()) {
-            std::sort(data.begin()+begin, data.begin()+end, [](const auto& a, const auto& b) {return a.ts < b.ts;});
+            if constexpr (Narrow)
+                std::sort(data.begin() + begin, data.begin() + end);
+            else
+                std::sort(data.begin() + begin, data.begin() + end,
+                          [](const auto& a, const auto& b) { return a.ts < b.ts; });
             return;
         }
         auto bucket = [&](Millis ts) { return std::size_t((ts - origin) / session_gap); };
-        for (auto i = begin; i < end; ++i) ++bins[bucket(data[i].ts)].count;
+        for (auto i = begin; i < end; ++i) ++bins[bucket(event_time(data[i]))].count;
         std::size_t position = 0;
         for (auto& b : bins) if (b.count) {
             b.earliest = b.latest = b.cursor = b.begin = position;
@@ -439,11 +458,11 @@ struct SessionOrder {
         scratch.resize(n);
         for (auto i = begin; i < end; ++i) {
             const auto& event = data[i];
-            auto& b = bins[bucket(event.ts)];
+            auto& b = bins[bucket(event_time(event))];
             auto pos = b.cursor++;
             scratch[pos] = event;
-            if (event.ts < scratch[b.earliest].ts) b.earliest = pos;
-            if (event.ts > scratch[b.latest].ts) b.latest = pos;
+            if (event_time(event) < event_time(scratch[b.earliest])) b.earliest = pos;
+            if (event_time(event) > event_time(scratch[b.latest])) b.latest = pos;
         }
         for (auto& b : bins) if (b.count) {
             std::swap(scratch[b.begin], scratch[b.earliest]);
@@ -455,10 +474,25 @@ struct SessionOrder {
     }
 };
 
-void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::size_t shard, const Catalog& catalog,
-               CampaignTotals& totals, UserRows& users, Millis start, Millis end, const PackedValues& values) {
-    SessionOrder order(start, end);
-    struct TimedClick { Millis ts; Name id; int campaign; };
+template <bool Narrow>
+void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::size_t shard,
+               const Catalog& catalog, CampaignTotals& totals, UserRows& users, Millis start, Millis end,
+               const PackedValues& values) {
+    using TimedEvent = EventTimeRow<Narrow>;
+    SessionOrder<Narrow> order(start, end);
+    auto event_time = [&](const TimedEvent& e) { return row_time<Narrow>(e, values.origin); };
+    using ClickStamp = std::conditional_t<Narrow, std::uint32_t, Millis>;
+    struct TimedClick {
+        Name id;
+        ClickStamp ts;
+        int campaign;
+    };
+    auto click_time = [&](const TimedClick& c) {
+        if constexpr (Narrow)
+            return values.origin + c.ts;
+        else
+            return c.ts;
+    };
     struct Activity {
         Name person;
         std::size_t event_begin = 0, event_end = 0, click_begin = 0, click_end = 0;
@@ -508,14 +542,25 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
     std::vector<TimedClick> clicks(nc);
     for (auto& worker : raw_events.local) {
         for (const auto& e : worker[shard]) {
-            auto sale = values.sale(e.purchase);
-            events[people[e.person.value].event_end++] = {values.millis(e.stamp), sale.price, sale.category};
+            auto& destination = events[people[e.person.value].event_end++];
+            if constexpr (Narrow)
+                destination = (std::uint64_t(e.stamp) << 32) | e.purchase;
+            else {
+                const auto sale = values.sale(e.purchase);
+                destination = {values.millis(e.stamp), sale.price, sale.category};
+            }
         }
         std::vector<Event>().swap(worker[shard]);
     }
     for (auto& worker : raw_clicks.local) {
-        for (const auto& c : worker[shard]) if (!c.person.empty())
-            clicks[people[c.person.value].click_end++] = {values.millis(c.stamp), c.id, c.campaign};
+        for (const auto& c : worker[shard]) {
+            if (c.person.empty()) continue;
+            auto& item = clicks[people[c.person.value].click_end++];
+            if constexpr (Narrow)
+                item = {c.id, c.stamp, c.campaign};
+            else
+                item = {c.id, values.millis(c.stamp), c.campaign};
+        }
         std::vector<Click>().swap(worker[shard]);
     }
     std::vector<int> click_counts(catalog.campaign_ids.size()), positions_in_window(click_counts.size());
@@ -545,7 +590,7 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
                          best < 0 ? nullptr : &catalog.categories[best]);
         };
         while (ei < activity.event_end) {
-            Millis start = events[ei].ts;
+            Millis start = event_time(events[ei]);
             int day = static_cast<int>(start / day_ms - (start % day_ms < 0));
             if (sessions && day != user_day) {
                 write_day();
@@ -558,24 +603,30 @@ void aggregate(Partition<Event>& raw_events, Partition<Click>& raw_clicks, std::
             std::int64_t revenue = 0;
             do {
                 const auto& event = events[ei++];
-                if (event.price) {
-                    revenue += event.price;
-                    if (!category_revenue[event.category]) purchased.push_back(event.category);
-                    category_revenue[event.category] += event.price;
+                Sale sale;
+                if constexpr (Narrow)
+                    sale = {int(event & 0xffffff), int(std::uint32_t(event) >> 24)};
+                else
+                    sale = {event.price, event.category};
+                if (sale.price) {
+                    revenue += sale.price;
+                    if (!category_revenue[sale.category]) purchased.push_back(sale.category);
+                    category_revenue[sale.category] += sale.price;
                 }
-            } while (ei < activity.event_end && events[ei].ts - events[ei - 1].ts <= session_gap);
+            } while (ei < activity.event_end &&
+                     event_time(events[ei]) - event_time(events[ei - 1]) <= session_gap);
             daily_events += ei - first;
             daily_revenue += revenue;
             // Identical duplicate clicks enter and leave together. Only distinct campaigns
             // and the identity of the final click affect either output.
-            while (right < activity.click_end && clicks[right].ts <= start) {
+            while (right < activity.click_end && click_time(clicks[right]) <= start) {
                 int id = clicks[right++].campaign;
                 if (click_counts[id]++ == 0) {
                     positions_in_window[id] = active.size();
                     active.push_back(id);
                 }
             }
-            while (left < right && clicks[left].ts < start - week_ms) {
+            while (left < right && click_time(clicks[left]) < start - week_ms) {
                 int campaign = clicks[left++].campaign;
                 if (!--click_counts[campaign]) {
                     int pos = positions_in_window[campaign];
@@ -671,7 +722,10 @@ int main(int argc, char** argv) {
         std::sort(order.rbegin(), order.rend());
         parallel(shards, [&](auto t, auto job) {
             auto shard = order[job].second;
-            aggregate(events, clicks, shard, catalog, totals[t], users[t], start, end, values);
+            if (values.narrow_time && values.narrow_sales)
+                aggregate<true>(events, clicks, shard, catalog, totals[t], users[t], start, end, values);
+            else
+                aggregate<false>(events, clicks, shard, catalog, totals[t], users[t], start, end, values);
         });
         for (auto& stream : users) stream.close();
         SparseTotals combined;

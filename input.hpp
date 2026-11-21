@@ -122,7 +122,7 @@ template <std::size_t N> bool fields(Text line, std::array<Text, N>& out) {
 #endif
 
 #if defined(__SSE2__) || defined(__ARM_NEON)
-struct Separators { std::uint64_t endings, quotes; };
+struct Separators { std::uint64_t endings, quotes, newlines; };
 #if defined(__ARM_NEON)
 inline std::uint16_t bitmask(uint8x16_t lanes) {
     static const uint8x16_t weights = {1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
@@ -137,12 +137,15 @@ inline Separators scan64(const char* bytes) {
         auto x = _mm_loadu_si128(reinterpret_cast<const __m128i*>(bytes + offset));
         int endings = _mm_movemask_epi8(_mm_or_si128(_mm_cmpeq_epi8(x, _mm_set1_epi8(',')),
                                                       _mm_cmpeq_epi8(x, _mm_set1_epi8('\n'))));
+        int newlines = _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_set1_epi8('\n')));
         int quotes = _mm_movemask_epi8(_mm_cmpeq_epi8(x, _mm_set1_epi8('"')));
 #else
         auto x = vld1q_u8(reinterpret_cast<const std::uint8_t*>(bytes + offset));
         int endings = bitmask(vorrq_u8(vceqq_u8(x, vdupq_n_u8(',')), vceqq_u8(x, vdupq_n_u8('\n'))));
+        int newlines = bitmask(vceqq_u8(x, vdupq_n_u8('\n')));
         int quotes = bitmask(vceqq_u8(x, vdupq_n_u8('"')));
 #endif
+        result.newlines |= std::uint64_t(newlines) << offset;
         result.endings |= std::uint64_t(endings) << offset;
         result.quotes |= std::uint64_t(quotes) << offset;
     }
@@ -158,6 +161,7 @@ __attribute__((target("avx2"))) inline Separators scan64_avx2(const char* bytes)
         auto quotes = _mm256_cmpeq_epi8(x, _mm256_set1_epi8('"'));
         auto ends = static_cast<std::uint32_t>(_mm256_movemask_epi8(_mm256_or_si256(commas, newlines)));
         auto quote_bits = static_cast<std::uint32_t>(_mm256_movemask_epi8(quotes));
+        result.newlines |= std::uint64_t(static_cast<std::uint32_t>(_mm256_movemask_epi8(newlines))) << offset;
         result.endings |= std::uint64_t(ends) << offset;
         result.quotes |= std::uint64_t(quote_bits) << offset;
     }
@@ -224,10 +228,102 @@ __attribute__((always_inline)) inline void vector_records(Text bytes, F& consume
     }
     if (first != block || column) field(block, true);
 }
+// Verify the CSV structure for a short run of complete lines before decoding
+// it. Each structural index stores a field end and whether its quotes must be
+// stripped. Newlines must occur at every Nth field, and every separator must
+// fall outside a quoted field. Unusual or malformed runs use the row scanner.
+template <std::size_t N, auto scan_block, typename F>
+__attribute__((always_inline)) inline void batched_records(Text bytes, F& consume) {
+    constexpr std::size_t max_bytes = 1024;
+    constexpr unsigned quoted = 0x8000;
+    std::array<std::uint16_t, max_bytes> field_ends;
+    std::array<Text, N> fields;
+    auto is_separator = [](char c) { return c == ',' || c == '\n'; };
+    while (!bytes.empty()) {
+        auto end = bytes.rfind('\n', std::min(bytes.size(), max_bytes) - 1);
+        if (end == Text::npos) {
+            end = bytes.find('\n');
+            const auto length = end == Text::npos ? bytes.size() : end + 1;
+            vector_records<N, scan_block>(bytes.substr(0, length), consume);
+            bytes.remove_prefix(length);
+            continue;
+        }
+        const auto batch = bytes.substr(0, end + 1);
+        bytes.remove_prefix(batch.size());
+        unsigned field_count = 0, row_columns = 0;
+        bool malformed = false, inside_quotes = false;
+        for (std::size_t offset = 0; offset < batch.size(); offset += 64) {
+            const auto length = std::min<std::size_t>(64, batch.size() - offset);
+            const char* source = batch.data() + offset;
+            char tail[64]{};
+            const char* scan = source;
+            if (length < 64) {
+                std::memcpy(tail, source, length);
+                scan = tail;
+            }
+            auto marks = scan_block(scan);
+            const bool left = !offset || is_separator(source[-1]);
+            const bool right = offset + length == batch.size() || is_separator(source[length]);
+            const auto edges = (marks.endings << 1) | left | (marks.endings >> 1)
+                             | (std::uint64_t(right) << (length - 1));
+            auto parity = marks.quotes;
+            parity ^= parity << 1;
+            parity ^= parity << 2;
+            parity ^= parity << 4;
+            parity ^= parity << 8;
+            parity ^= parity << 16;
+            parity ^= parity << 32;
+            if (inside_quotes) parity = ~parity;
+            inside_quotes = (parity >> (length - 1)) & 1;
+            if ((marks.quotes & ~edges) || (parity & marks.endings)) {
+                malformed = true;
+                break;
+            }
+            auto remaining = marks.endings;
+            for (auto lines = marks.newlines; lines; lines &= lines - 1) {
+                const auto boundary = lines & -lines;
+                const auto through = boundary | (boundary - 1);
+                row_columns += __builtin_popcountll(remaining & through);
+                if (row_columns != N) {
+                    malformed = true;
+                    break;
+                }
+                remaining &= ~through;
+                row_columns = 0;
+            }
+            if (malformed) break;
+            row_columns += __builtin_popcountll(remaining);
+            const auto closing = (marks.quotes << 1) | std::uint64_t(offset && source[-1] == '"');
+            for (auto separators = marks.endings; separators; separators &= separators - 1) {
+                const unsigned bit = __builtin_ctzll(separators);
+                field_ends[field_count++] = std::uint16_t((offset + bit) | (((closing >> bit) & 1) * quoted));
+            }
+        }
+        if (malformed) {
+            vector_records<N, scan_block>(batch, consume);
+            continue;
+        }
+        unsigned begin = 0;
+        for (unsigned i = 0; i < field_count; i += N) {
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 8
+#endif
+            for (unsigned j = 0; j < N; ++j) {
+                const unsigned encoded = field_ends[i + j];
+                const unsigned end = encoded & (quoted - 1), trim = encoded >> 15;
+                fields[j] = Text(batch.data() + begin + trim, end - begin - 2 * trim);
+                begin = end + 1;
+            }
+            consume(fields);
+        }
+    }
+}
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
 template <std::size_t N, typename F>
 __attribute__((target("avx2"))) void records_avx2(Text bytes, F& consume) {
-    vector_records<N, scan64_avx2>(bytes, consume);
+    batched_records<N, scan64_avx2>(bytes, consume);
 }
 #endif
 #endif
@@ -240,7 +336,7 @@ template <std::size_t N, typename F> void records(Text bytes, F consume) {
         return;
     }
 #endif
-    vector_records<N, scan64>(bytes, consume);
+    batched_records<N, scan64>(bytes, consume);
 #else
     each_line(bytes, [&](Text line) {
         std::array<Text, N> row;
@@ -316,11 +412,33 @@ inline Millis midnight(const char* p) {
     return date.millis;
 }
 
+// Hours, minutes and seconds start at byte offsets 0, 3 and 6. Decode all
+// three digit pairs in one word. Ingestion times are guaranteed to be F1.
+template<bool validate> inline int daytime(const char* p) {
+    std::uint64_t bytes;
+    std::memcpy(&bytes, p, 8);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    bytes = __builtin_bswap64(bytes);
+#endif
+    constexpr auto first_digits = UINT64_C(0x000f00000f00000f);
+    const auto pairs = (bytes & first_digits) * 10 + ((bytes >> 8) & first_digits);
+    const int hour = pairs & 255, minute = (pairs >> 24) & 255, second = pairs >> 48;
+    if constexpr (validate) {
+        constexpr auto digits = UINT64_C(0xffff00ffff00ffff), zero = UINT64_C(0x3030303030303030);
+        const auto numbers = (bytes & digits) | (zero & ~digits);
+        const auto nondigits = ((numbers - zero) | (numbers + UINT64_C(0x4646464646464646)))
+                             & UINT64_C(0x8080808080808080);
+        if (((bytes ^ UINT64_C(0x3a3a3a3a3a3a3a3a)) & ~digits) || nondigits ||
+            hour > 23 || minute > 59 || second > 59) return -1;
+    }
+    return (hour * 60 + minute) * 60 + second;
+}
+
 inline Millis ingest_time(Text value) {
     if (value.size() != 20) return invalid_time;
     const auto* p = value.data();
     // ingest_ts is guaranteed to be a valid F1 timestamp.
-    const auto seconds = (digit_pair(p + 11) * 60 + digit_pair(p + 14)) * 60 + digit_pair(p + 17);
+    const auto seconds = daytime<false>(p + 11);
     return midnight(p) + seconds * 1000;
 }
 
@@ -331,9 +449,9 @@ inline Millis timestamp(Text value) {
     }
     if (value.size() != 20 && value.size() != 25) return invalid_time;
     const auto* p = value.data();
-    if (p[10] != 'T' || p[13] != ':' || p[16] != ':') return invalid_time;
-    const auto hour = digit_pair(p + 11), minute = digit_pair(p + 14), sec = digit_pair(p + 17);
-    if (hour > 23 || minute > 59 || sec > 59) return invalid_time;
+    if (p[10] != 'T') return invalid_time;
+    const int seconds = daytime<true>(p + 11);
+    if (seconds < 0) return invalid_time;
     int offset = 0;
     if (value.size() == 20) {
         if (p[19] != 'Z') return invalid_time;
@@ -345,5 +463,5 @@ inline Millis timestamp(Text value) {
     }
     const auto day = midnight(p);
     if (day == invalid_time) return day;
-    return day + ((static_cast<int>(hour * 60 + minute) - offset) * 60 + static_cast<int>(sec)) * 1000LL;
+    return day + (seconds - offset * 60) * 1000LL;
 }
