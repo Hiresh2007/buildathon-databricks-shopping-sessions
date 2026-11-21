@@ -297,12 +297,15 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
     Partition<Version, id_shards> versions;
     versions.reserve_rows(files.estimated_rows());
     std::vector<NamePool> ids(threads);
+    const auto lookahead = 2 * threads;
+    files.start_prefetch(lookahead);
     auto graph = std::make_unique<ConnectedAliases>(links);
     parallel(links.chunks.size() + files.chunks.size(), [&](auto t, auto j) {
         if (j < links.chunks.size()) {
             graph->read(links.chunks[j], t);
             return;
         }
+        files.prefetch(j - links.chunks.size() + lookahead);
         auto general = [&](const auto &f) {
             if (f[0].empty())
                 return;
@@ -420,7 +423,10 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
 void load_clicks(const Files& files, const People& people, const Catalog& catalog,
                  Millis start, Millis end, Partition<Click>& out, std::vector<NamePool>& names, PackedValues& values) {
     out.reserve_rows(files.estimated_rows());
+    const auto lookahead = 2 * threads;
+    files.start_prefetch(lookahead);
     parallel(files.chunks.size(), [&](auto t, auto j) {
+        files.prefetch(j + lookahead);
         auto general = [&](const auto &f) {
             if (f[0].empty() || f[1].empty())
                 return;

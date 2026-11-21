@@ -48,25 +48,66 @@ public:
         other.address_ = nullptr;
     }
     ~MappedFile() { if (address_) munmap(const_cast<char*>(address_), size_); }
-    Text rows() const {
-        if (!size_) return {};
-        Text content(address_, size_);
-        auto end = content.find('\n');
-        return end == Text::npos ? Text{} : content.substr(end + 1);
+    Text content() const {
+        return size_ ? Text(address_, size_) : Text{};
     }
+
 };
 
 struct Files {
-    std::vector<MappedFile> mapped;
-    std::vector<Text> chunks;
-    // Size reservations only; an atypical sample cannot affect row selection.
-    std::size_t estimated_rows() const {
-        std::size_t rows = 0;
-        for (auto chunk : chunks) {
-            auto sample = chunk.substr(0, 2048);
-            if (!sample.empty()) rows += chunk.size() * std::count(sample.begin(), sample.end(), '\n') / sample.size();
+    struct Chunk {
+        Text data;
+        std::size_t offset;
+        constexpr static std::size_t size = 1u << 21;
+        // Each worker owns the records that begin in its fixed byte range.
+        // The mapping starts at a page boundary, while the first CSV record can start later.
+        void prefetch() const {
+            const auto end = std::min(data.size(), offset + size);
+            auto base = reinterpret_cast<std::uintptr_t>(data.data() + offset);
+            static const auto page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
+            auto first = base & ~(page - 1);
+            ::madvise(reinterpret_cast<void *>(first), base - first + end - offset, MADV_WILLNEED);
         }
-        return rows;
+        // Skip the header in the first range or a partial row at any later range.
+        // Only the owner of a long row searches past its range for the terminating newline.
+        operator Text() const {
+            const auto end = std::min(data.size(), offset + size);
+            auto begin = offset;
+            if (!begin || data[begin - 1] != '\n') {
+                const auto next = data.substr(begin, end - begin).find('\n');
+                if (next == Text::npos)
+                    return {};
+                begin += next + 1;
+            }
+            if (begin == end)
+                return {};
+            auto finish = end;
+            if (end < data.size() && data[end - 1] != '\n') {
+                auto next = data.find('\n', end);
+                finish = next == Text::npos ? data.size() : next + 1;
+            }
+            return data.substr(begin, finish - begin);
+        }
+    };
+    std::vector<MappedFile> mapped;
+    std::vector<Chunk> chunks;
+    std::size_t total_bytes = 0;
+    Text largest_file;
+    void prefetch(std::size_t index) const {
+        if (index < chunks.size())
+            chunks[index].prefetch();
+    }
+    void start_prefetch(std::size_t n) const {
+        for (std::size_t i = 0; i < std::min(n, chunks.size()); ++i)
+            chunks[i].prefetch();
+    }
+    std::size_t estimated_rows() const {
+        auto sample = largest_file.substr(0, 8192);
+        auto first = sample.find('\n');
+        if (first == Text::npos || first + 1 == sample.size())
+            return 0;
+        sample.remove_prefix(first + 1);
+        return total_bytes * std::count(sample.begin(), sample.end(), '\n') / sample.size();
     }
     explicit Files(const fs::path& path) {
         if (fs::is_directory(path)) {
@@ -75,15 +116,13 @@ struct Files {
         } else {
             mapped.emplace_back(path);
         }
-        for (const auto& file : mapped) {
-            auto data = file.rows();
-            while (!data.empty()) {
-                constexpr std::size_t block_size = 1U << 21;
-                const auto pos = data.size() > block_size ? data.find('\n', block_size) : Text::npos;
-                const auto length = pos == Text::npos ? data.size() : pos + 1;
-                chunks.push_back(data.substr(0, length));
-                data.remove_prefix(length);
-            }
+        for (const auto &file : mapped) {
+            auto data = file.content();
+            total_bytes += data.size();
+            if (data.size() > largest_file.size())
+                largest_file = data;
+            for (std::size_t offset = 0; offset < data.size(); offset += Chunk::size)
+                chunks.push_back({data, offset});
         }
     }
 };
@@ -254,69 +293,17 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
     // Each scanner instantiation has its own thread-local cache and callback geometry.
     static thread_local std::array<Entry, cache_size> cache{};
     std::array<Text, N> fields;
-    while (!bytes.empty()) {
-        auto newline_at = bytes.rfind('\n', std::min<std::size_t>(batch_size, bytes.size()) - 1);
-        if (newline_at == Text::npos) {
-            newline_at = bytes.find('\n');
-            auto n = newline_at == Text::npos ? bytes.size() : newline_at + 1;
-            vector_records<N, scan_block>(bytes.substr(0, n), emit);
-            bytes.remove_prefix(n);
-            continue;
-        }
-        auto part = bytes.substr(0, newline_at + 1);
-        bytes.remove_prefix(part.size());
-        std::array<Separators, batch_size / 64 + 3> blocks;
-        unsigned count = 0;
-        for (unsigned i = 0; i < part.size(); i += 64) {
-            if (part.size() - i >= 64)
-                blocks[count++] = scan_block(part.data() + i);
-            else {
-                char tail[64]{};
-                std::memcpy(tail, part.data() + i, part.size() - i);
-                blocks[count++] = scan_block(tail);
-            }
-        }
-        blocks[count] = blocks[count + 1] = blocks[count + 2] = Separators{};
-        unsigned begin = 0;
-        auto low_bits = [](unsigned n) { return n >= 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; };
-        auto rotate = [](std::uint64_t x, unsigned k) { return (x << k) | (x >> (64 - k)); };
-        while (begin < part.size()) {
-            const auto *s = blocks.data() + begin / 64;
-            auto shift = begin & 63;
-            auto join = [&](std::uint64_t l, std::uint64_t hash) {
-                return (l >> shift) | (shift ? (hash << (64 - shift)) : 0);
-            };
-            auto newline = join(s[0].newlines, s[1].newlines);
-            unsigned row_size = 0;
-            if (newline)
-                row_size = 1 + __builtin_ctzll(newline);
-            else {
-                newline = join(s[1].newlines, s[2].newlines);
-                if (newline)
-                    row_size = 65 + __builtin_ctzll(newline);
-            }
-            if (!row_size) {
-                auto end = part.find('\n', begin + 128);
-                row_size = static_cast<unsigned>(end + 1 - begin);
-                vector_records<N, scan_block>(part.substr(begin, row_size), emit);
-                begin += row_size;
-                continue;
-            }
-            const auto ends_low = join(s[0].endings, s[1].endings) & low_bits(row_size);
-            const auto quotes_low = join(s[0].quotes, s[1].quotes) & low_bits(row_size);
-            auto ends_high = UINT64_C(0), quotes_high = UINT64_C(0);
-            if (row_size > 64) {
-                auto mask = low_bits(row_size - 64);
-                ends_high = join(s[1].endings, s[2].endings) & mask;
-                quotes_high = join(s[1].quotes, s[2].quotes) & mask;
-            }
+    auto rotate = [](std::uint64_t value, unsigned count) {
+        return (value << count) | (value >> (64 - count));
+    };
+    auto visit =
+        [&](const char *row, std::uint64_t ends_low, std::uint64_t quotes_low, std::uint64_t ends_high,
+            std::uint64_t quotes_high) __attribute__((always_inline)) {
             auto hash = (ends_low ^ rotate(quotes_low, 17)) * UINT64_C(0x9e3779b97f4a7c15) +
                         (ends_high ^ rotate(quotes_high, 27)) * UINT64_C(0xbf58476d1ce4e5b9);
             auto slot = N == 4 ? (hash >> (64 - __builtin_ctz(cache_size)))
                                : ((hash ^ (hash >> 29)) & (cache_size - 1));
             auto &entry = cache[slot];
-            auto row = part.data() + begin;
-            begin += row_size;
             // Check all four masks, including the newline. A hash collision only replaces an entry.
             if (entry.ends_low != ends_low || entry.ends_high != ends_high ||
                 entry.quotes_low != quotes_low || entry.quotes_high != quotes_high) {
@@ -326,7 +313,7 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
                 entry.quotes_high = quotes_high;
                 entry.valid_layout = false;
                 if (__builtin_popcountll(ends_low) + __builtin_popcountll(ends_high) != N)
-                    continue;
+                    return;
                 // Reconstruct exactly two quotes around each quoted field. Equality with
                 // the input masks also rejects stray quotes inside unquoted fields.
                 auto a = ends_low, b = ends_high;
@@ -373,7 +360,7 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
                 if constexpr (std::is_base_of_v<FixedWidthRowTag<N>, F>)
                     if (entry.fixed_width) {
                         emit.common(row, entry);
-                        continue;
+                        return;
                     }
 
 #if defined(__clang__)
@@ -385,8 +372,104 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
                     fields[j] = {row + entry.begin[j], entry.length[j]};
                 emit(fields);
             }
+        };
+#if defined(__x86_64__) || defined(__i386__)
+    // Read from each record start. The first newline bounds both the row and its shape-cache key.
+    auto low_bits = [](unsigned n) { return n >= 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; };
+    while (bytes.size() >= 128) {
+        const char *row = bytes.data();
+        auto first = scan_block(row);
+        unsigned row_size = 0;
+        std::uint64_t ends_low, quotes_low, ends_high = 0, quotes_high = 0;
+        if (first.newlines) {
+            row_size = 1 + __builtin_ctzll(first.newlines);
+            auto mask = low_bits(row_size);
+            ends_low = first.endings & mask;
+            quotes_low = first.quotes & mask;
+        } else {
+            auto second = scan_block(row + 64);
+            if (!second.newlines) {
+                auto following = bytes.find('\n', 128);
+                auto length = following == Text::npos ? bytes.size() : following + 1;
+                vector_records<N, scan_block>(bytes.substr(0, length), emit);
+                bytes.remove_prefix(length);
+                continue;
+            }
+            row_size = 65 + __builtin_ctzll(second.newlines);
+            auto mask = low_bits(row_size - 64);
+            ends_low = first.endings;
+            quotes_low = first.quotes;
+            ends_high = second.endings & mask;
+            quotes_high = second.quotes & mask;
+        }
+        bytes.remove_prefix(row_size);
+        visit(row, ends_low, quotes_low, ends_high, quotes_high);
+    }
+    if (!bytes.empty())
+        vector_records<N, scan_block>(bytes, emit);
+#else
+    // NEON reuses each block's separator masks across all rows in that block.
+    while (!bytes.empty()) {
+        auto newline_at = bytes.rfind('\n', std::min<std::size_t>(batch_size, bytes.size()) - 1);
+        if (newline_at == Text::npos) {
+            newline_at = bytes.find('\n');
+            auto n = newline_at == Text::npos ? bytes.size() : newline_at + 1;
+            vector_records<N, scan_block>(bytes.substr(0, n), emit);
+            bytes.remove_prefix(n);
+            continue;
+        }
+        auto part = bytes.substr(0, newline_at + 1);
+        bytes.remove_prefix(part.size());
+        std::array<Separators, batch_size / 64 + 3> blocks;
+        unsigned count = 0;
+        for (unsigned i = 0; i < part.size(); i += 64) {
+            if (part.size() - i >= 64)
+                blocks[count++] = scan_block(part.data() + i);
+            else {
+                char tail[64]{};
+                std::memcpy(tail, part.data() + i, part.size() - i);
+                blocks[count++] = scan_block(tail);
+            }
+        }
+        blocks[count] = blocks[count + 1] = blocks[count + 2] = Separators{};
+        unsigned begin = 0;
+        auto low_bits = [](unsigned n) { return n >= 64 ? UINT64_MAX : (UINT64_C(1) << n) - 1; };
+        while (begin < part.size()) {
+            const auto *s = blocks.data() + begin / 64;
+            auto shift = begin & 63;
+            auto join = [&](std::uint64_t l, std::uint64_t hash) {
+                return (l >> shift) | (shift ? (hash << (64 - shift)) : 0);
+            };
+            auto newline = join(s[0].newlines, s[1].newlines);
+            unsigned row_size = 0;
+            if (newline)
+                row_size = 1 + __builtin_ctzll(newline);
+            else {
+                newline = join(s[1].newlines, s[2].newlines);
+                if (newline)
+                    row_size = 65 + __builtin_ctzll(newline);
+            }
+            if (!row_size) {
+                auto end = part.find('\n', begin + 128);
+                row_size = static_cast<unsigned>(end + 1 - begin);
+                vector_records<N, scan_block>(part.substr(begin, row_size), emit);
+                begin += row_size;
+                continue;
+            }
+            const auto ends_low = join(s[0].endings, s[1].endings) & low_bits(row_size);
+            const auto quotes_low = join(s[0].quotes, s[1].quotes) & low_bits(row_size);
+            auto ends_high = UINT64_C(0), quotes_high = UINT64_C(0);
+            if (row_size > 64) {
+                auto mask = low_bits(row_size - 64);
+                ends_high = join(s[1].endings, s[2].endings) & mask;
+                quotes_high = join(s[1].quotes, s[2].quotes) & mask;
+            }
+            const auto *row = part.data() + begin;
+            begin += row_size;
+            visit(row, ends_low, quotes_low, ends_high, quotes_high);
         }
     }
+#endif
 }
 
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
