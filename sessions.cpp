@@ -166,41 +166,83 @@ struct People {
 };
 
 struct CatalogIndex {
-    struct Entry { Text key; int value = -1; };
-    Names fallback;
-    Text prefix;
-    std::vector<Entry> dense;
+    struct Item {
+        Text key;
+        int value;
+    };
+    struct Entry {
+        std::uint64_t key = 0;
+        int value = -1;
+    };
+    std::vector<Item> items;
+    std::vector<Entry> slots;
+    Names long_keys;
 
-    void compact() {
-        if (fallback.empty()) return;
-        auto sample = fallback.begin()->first;
-        auto cut = sample.size();
-        while (cut && sample[cut-1] >= '0' && sample[cut-1] <= '9') --cut;
-        if (cut == sample.size()) return;
-        prefix = sample.substr(0, cut);
-        std::size_t limit = std::min<std::size_t>(fallback.size()*4, 4000000), largest = 0;
-        for (const auto& [key, value] : fallback) {
-            if (key.size() <= cut || key.substr(0, cut) != prefix) return;
-            auto i = number(key.substr(cut), limit);
-            if (i < 0) return;
-            largest = std::max(largest, std::size_t(i));
+    void add(Text key, int value) { items.push_back({key, value}); }
+
+    // The marker above the last byte encodes the length, including for keys
+    // containing NULs. Both overlapping loads stay inside the string.
+    static std::uint64_t pack(Text key) {
+        const auto size = key.size();
+        std::uint64_t bytes = 0;
+        if (size >= 4) {
+            std::uint32_t first, last;
+            std::memcpy(&first, key.data(), 4);
+            std::memcpy(&last, key.end() - 4, 4);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+            first = __builtin_bswap32(first);
+            last = __builtin_bswap32(last);
+#endif
+            bytes = first | (std::uint64_t(last) << (8 * (size - 4)));
+        } else {
+            if (size >= 2) {
+                std::uint16_t first;
+                std::memcpy(&first, key.data(), 2);
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+                first = __builtin_bswap16(first);
+#endif
+                bytes = first;
+            }
+            if (size & 1)
+                bytes |= std::uint64_t(static_cast<unsigned char>(key.back())) << (8 * (size - 1));
         }
-        dense.resize(largest + 1);
-        for (const auto& [key, value] : fallback) {
-            auto& entry = dense[number(key.substr(cut), limit)];
-            if (entry.value != -1) { dense.clear(); return; }
-            entry = {key, value};
-        }
-        Names().swap(fallback);
+        return bytes | (UINT64_C(1) << (8 * size));
     }
-    int find(Text key) const {
-        if (!dense.empty()) {
-            if (key.size() <= prefix.size()) return -1;
-            const auto i = number(key.substr(prefix.size()), dense.size()-1);
-            return i < 0 || dense[i].key != key ? -1 : dense[i].value;
+
+    std::size_t slot(std::uint64_t key) const {
+        const auto mixed = key * UINT64_C(0x9e3779b97f4a7c15);
+        const auto mask = slots.size() - 1;
+        auto i = (mixed ^ (mixed >> 32)) & mask;
+        while (slots[i].key && slots[i].key != key) i = (i + 1) & mask;
+        return i;
+    }
+
+    void compact(bool retain_first) {
+        const auto short_keys = std::count_if(items.begin(), items.end(), [](const Item& item) {
+            return item.key.size() <= 7;
+        });
+        std::size_t capacity = 1;
+        while (capacity < 2 * static_cast<std::size_t>(short_keys)) capacity *= 2;
+        slots.resize(capacity);
+        long_keys.reserve(items.size() - short_keys);
+        for (const auto& item : items) {
+            if (item.key.size() <= 7) {
+                const auto key = pack(item.key);
+                auto& entry = slots[slot(key)];
+                if (!entry.key || !retain_first) entry = {key, item.value};
+            } else if (retain_first) {
+                long_keys.emplace(item.key, item.value);
+            } else {
+                long_keys[item.key] = item.value;
+            }
         }
-        auto it = fallback.find(key);
-        return it == fallback.end() ? -1 : it->second;
+        std::vector<Item>().swap(items);
+    }
+
+    int find(Text key) const {
+        if (key.size() <= 7) return slots[slot(pack(key))].value;
+        const auto it = long_keys.find(key);
+        return it == long_keys.end() ? -1 : it->second;
     }
 };
 
@@ -214,17 +256,17 @@ struct Catalog {
             if (!fields(line, f)) return;
             auto [category, fresh] = category_index.try_emplace(f[1], static_cast<int>(categories.size()));
             if (fresh) categories.push_back(f[1]);
-            products.fallback[f[0]] = category->second;
+            products.add(f[0], category->second);
         });
         for (auto chunk : campaign_files.chunks) each_line(chunk, [&](Text line) {
             std::array<Text, 2> f;
             if (!fields(line, f)) return;
-            campaigns.fallback.emplace(f[0], static_cast<int>(campaign_ids.size()));
+            campaigns.add(f[0], static_cast<int>(campaign_ids.size()));
             campaign_ids.push_back(f[0]);
             channels.push_back(f[1]);
         });
-        products.compact();
-        campaigns.compact();
+        products.compact(false);
+        campaigns.compact(true);
     }
 };
 
@@ -494,13 +536,6 @@ struct CampaignTotals {
     Totals& get(int id, int day) {
         if (dense.empty()) return sparse[{id, day}];
         return dense[std::size_t(day - first_day) * campaigns + id];
-    }
-    void merge_into(SparseTotals& combined) const {
-        for (const auto& [key, value] : sparse) combined[key].add(value);
-        for (std::size_t i = 0; i < dense.size(); ++i) {
-            if (dense[i].sessions || dense[i].assists)
-                combined[{int(i % campaigns), first_day + int(i / campaigns)}].add(dense[i]);
-        }
     }
 };
 
@@ -865,8 +900,6 @@ int main(int argc, char** argv) {
                 aggregate<false>(events, clicks, shard, catalog, totals[t], users[t], start, end, values);
         });
         for (auto& stream : users) stream.close();
-        SparseTotals combined;
-        for (const auto& local : totals) local.merge_into(combined);
         FlatParquet report(output / "campaign_daily" / "part-0.parquet", {{"campaign_id", 6, 0},
                                                                           {"channel", 6, 0},
                                                                           {"day", 1, 6},
@@ -896,16 +929,34 @@ int main(int argc, char** argv) {
             revenue.clear();
             assists.clear();
         };
-        for (const auto &[key, metrics] : combined) {
-            byte_string(ids, catalog.campaign_ids[key.id]);
-            byte_string(channels, catalog.channels[key.id]);
-            days.push_back(key.day);
+        auto append = [&](int id, int day, const Totals& metrics) {
+            byte_string(ids, catalog.campaign_ids[id]);
+            byte_string(channels, catalog.channels[id]);
+            days.push_back(day);
             counts.push_back(metrics.sessions);
             purchasing.push_back(metrics.purchasing);
             revenue.push_back(metrics.revenue);
             assists.push_back(metrics.assists);
             if (days.size() >= 32768 || ids.size() >= (1U << 26) || channels.size() >= (1U << 26))
                 flush();
+        };
+        if (!totals.front().dense.empty()) {
+            // All workers use the same (day, campaign) positions. Reduce each
+            // position directly into the output row, including assist-only rows.
+            const auto& first = totals.front();
+            for (std::size_t begin = 0; begin < first.dense.size(); begin += first.campaigns) {
+                const auto day = first.first_day + static_cast<int>(begin / first.campaigns);
+                for (std::size_t id = 0; id < first.campaigns; ++id) {
+                    Totals combined{};
+                    for (const auto& local : totals) combined.add(local.dense[begin + id]);
+                    if (combined.sessions || combined.assists) append(static_cast<int>(id), day, combined);
+                }
+            }
+        } else {
+            SparseTotals combined;
+            for (const auto& local : totals)
+                for (const auto& [key, value] : local.sparse) combined[key].add(value);
+            for (const auto& [key, metrics] : combined) append(key.id, key.day, metrics);
         }
         flush();
         report.close();
