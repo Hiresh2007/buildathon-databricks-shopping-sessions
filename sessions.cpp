@@ -270,18 +270,41 @@ struct Event { Name person; std::uint32_t stamp, purchase; };
 struct Click { Name person, id; std::uint32_t stamp; int campaign; };
 struct Version { Name id; Millis ingest; Event event; };
 
-Event validate_event(const std::array<Text, 7>& f, Millis ingest, Millis start, Millis end,
-                     const Catalog& catalog, NamePool& names, PackedValues& values, std::size_t reader) {
+template <int shape>
+__attribute__((always_inline)) inline Event
+validate_event(const std::array<Text, 7> &f, Millis ingest, Millis start, Millis end, const Catalog &catalog,
+               NamePool &names, PackedValues &values, std::size_t reader) {
     if (f[1].empty() || f[5].empty()) return {};
-    const auto ts = timestamp(f[2]);
+    // The structural scanner passes the decoded widths for these six forms.
+    // The generic row scanner passes -1 and performs ordinary validation.
+    auto clock = f[2];
+    if constexpr (shape >= 0 && shape % 3 == 0) {
+        if (clock.size() != 20)
+            __builtin_unreachable();
+    }
+    if constexpr (shape >= 0 && shape % 3 == 1) {
+        if (clock.size() != 25)
+            __builtin_unreachable();
+    }
+    const auto ts = timestamp(clock);
     if (ts < start || ts >= end || ingest - ts > day_ms) return {};
     int price = 0, category = 0;
-    if (f[4] == "purchase") {
+    auto kind = f[4];
+    if constexpr (shape >= 3) {
+        if (kind.size() != 8)
+            __builtin_unreachable();
+    }
+    if constexpr (shape >= 0 && shape < 3) {
+        if (kind.size() == 8)
+            __builtin_unreachable();
+    }
+    if (kind == "purchase") {
         price = static_cast<int>(number(f[6], 10'000'000));
         if (price < 1) return {};
         auto product = catalog.products.find(f[5]);
         if (product >= 0) category = product;
-    } else if (f[4] != "view" && f[4] != "cart") return {};
+    } else if (f[4] != "view" && f[4] != "cart")
+        return {};
     return {names.get(f[1]), values.time(ts, reader), values.purchase(price, category, reader)};
 }
 
@@ -297,15 +320,22 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
             graph->read(links.chunks[j], t);
             return;
         }
-        records<7>(files.chunks[j - links.chunks.size()], [&](const auto& f) {
-            if (f[0].empty()) return;
+        auto record = [&](const auto &f, auto shape) {
+            if (f[0].empty())
+                return;
             auto id = ids[t].get(f[0]);
             auto hash = id.hash();
             auto ingest = ingest_time(f[3]);
-            if (ingest == invalid_time) return;
+            if (ingest == invalid_time)
+                return;
             // Retain the earliest version even when its payload fails validation.
-            versions.add(t, hash, {id, ingest, validate_event(f, ingest, start, end, catalog, names[t], values, t)});
-        });
+            versions.add(t, hash,
+                         {id, ingest,
+                          validate_event<decltype(shape)::value>(f, ingest, start, end, catalog, names[t],
+                                                                 values, t)});
+        };
+        EventShapes<decltype(record)> receiver(record);
+        records<7>(files.chunks[j - links.chunks.size()], receiver);
     });
     people.emplace(*graph);
     graph.reset();
@@ -692,8 +722,9 @@ int main(int argc, char** argv) {
             throw std::runtime_error("cannot start manifest compatibility launcher");
         }
         threads = std::clamp(std::stoi(argc == 6 ? argv[5] : environment("NCPU", "8")), 1, 8);
-        Files links(data / "links"), products(data / "products.csv"), campaigns(data / "campaigns.csv");
-        Files event_files(data / "events"), click_files(data / "clicks");
+        Files links(data / "links", threads), products(data / "products.csv"),
+            campaigns(data / "campaigns.csv");
+        Files event_files(data / "events", threads), click_files(data / "clicks", threads);
         std::optional<People> people;
         Catalog catalog(products, campaigns);
         PackedValues values(start, end, catalog.categories.size());

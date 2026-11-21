@@ -1,6 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <type_traits>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -38,6 +43,10 @@ public:
                 close(fd);
                 throw std::runtime_error("cannot map " + path.string());
             }
+            // Submit bounded page-cache hints for each mapped file.
+            constexpr std::size_t request = 1U << 21;
+            for (std::size_t pos = 0; pos < size_; pos += request)
+                madvise(static_cast<char *>(mapped) + pos, std::min(request, size_ - pos), MADV_WILLNEED);
             address_ = static_cast<const char*>(mapped);
         }
         close(fd);
@@ -67,22 +76,65 @@ struct Files {
         }
         return rows;
     }
-    explicit Files(const fs::path& path) {
+    explicit Files(const fs::path &path, std::size_t workers = 1) {
+        std::vector<fs::path> paths;
         if (fs::is_directory(path)) {
-            for (const auto& entry : fs::directory_iterator(path))
-                if (entry.path().extension() == ".csv") mapped.emplace_back(entry.path());
-        } else {
-            mapped.emplace_back(path);
-        }
-        for (const auto& file : mapped) {
-            auto data = file.rows();
+            for (const auto &file : fs::directory_iterator(path))
+                if (file.path().extension() == ".csv")
+                    paths.push_back(file.path());
+        } else
+            paths.push_back(path);
+        struct Loaded {
+            std::optional<MappedFile> map;
+            std::vector<Text> chunks;
+        };
+        std::vector<Loaded> parts(paths.size());
+        auto read = [&](std::size_t i) {
+            auto &part = parts[i];
+            part.map.emplace(paths[i]);
+            auto data = part.map->rows();
             while (!data.empty()) {
-                constexpr std::size_t block_size = 1U << 21;
-                const auto pos = data.size() > block_size ? data.find('\n', block_size) : Text::npos;
-                const auto length = pos == Text::npos ? data.size() : pos + 1;
-                chunks.push_back(data.substr(0, length));
-                data.remove_prefix(length);
+                constexpr auto block = 1U << 21;
+                auto p = data.size() > block ? data.find('\n', block) : Text::npos;
+                auto n = p == Text::npos ? data.size() : p + 1;
+                part.chunks.push_back(data.substr(0, n));
+                data.remove_prefix(n);
             }
+        };
+        if (parts.size() <= 1) {
+            if (!parts.empty())
+                read(0);
+        } else {
+            std::atomic<std::size_t> next{0};
+            std::exception_ptr error;
+            std::mutex guard;
+            auto worker = [&] {
+                try {
+                    for (;;) {
+                        auto i = next.fetch_add(1);
+                        if (i >= parts.size())
+                            return;
+                        read(i);
+                    }
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(guard);
+                    if (!error)
+                        error = std::current_exception();
+                }
+            };
+            std::vector<std::thread> pool;
+            for (std::size_t i = 1; i < std::min(workers, parts.size()); i++)
+                pool.emplace_back(worker);
+            worker();
+            for (auto &t : pool)
+                t.join();
+            if (error)
+                std::rethrow_exception(error);
+        }
+        mapped.reserve(parts.size());
+        for (auto &part : parts) {
+            mapped.push_back(std::move(*part.map));
+            chunks.insert(chunks.end(), part.chunks.begin(), part.chunks.end());
         }
     }
 };
@@ -114,6 +166,20 @@ template <std::size_t N> bool fields(Text line, std::array<Text, N>& out) {
     }
     return true;
 }
+
+// The event validator accepts rows in any order inside a batch. Other
+// consumers retain physical input order, including the malformed-row path.
+struct ReceivingEventShapes {};
+template <class F> struct EventShapes : ReceivingEventShapes {
+    F &receiver;
+    explicit EventShapes(F &fn) : receiver(fn) {}
+    void operator()(const std::array<Text, 7> &row) {
+        receiver(row, std::integral_constant<int, -1>{});
+    }
+    template <class Shape> void operator()(const std::array<Text, 7> &row, Shape shape) {
+        receiver(row, shape);
+    }
+};
 
 #if defined(__SSE2__)
 #include <immintrin.h>
@@ -234,7 +300,7 @@ __attribute__((always_inline)) inline void vector_records(Text bytes, F& consume
 // fall outside a quoted field. Unusual or malformed runs use the row scanner.
 template <std::size_t N, auto scan_block, typename F>
 __attribute__((always_inline)) inline void batched_records(Text bytes, F& consume) {
-    constexpr std::size_t max_bytes = 1024;
+    constexpr std::size_t max_bytes = N == 7 ? 2048 : 1024;
     constexpr unsigned quoted = 0x8000;
     std::array<std::uint16_t, max_bytes> field_ends;
     std::array<Text, N> fields;
@@ -303,21 +369,53 @@ __attribute__((always_inline)) inline void batched_records(Text bytes, F& consum
             vector_records<N, scan_block>(batch, consume);
             continue;
         }
-        unsigned begin = 0;
-        for (unsigned i = 0; i < field_count; i += N) {
+        auto dispatch = [&](unsigned i, auto shape) {
+            unsigned begin = i ? (field_ends[i - 1] & (quoted - 1)) + 1 : 0;
 #if defined(__clang__)
 #pragma clang loop unroll(full)
 #elif defined(__GNUC__)
 #pragma GCC unroll 8
 #endif
-            for (unsigned j = 0; j < N; ++j) {
-                const unsigned encoded = field_ends[i + j];
-                const unsigned end = encoded & (quoted - 1), trim = encoded >> 15;
-                fields[j] = Text(batch.data() + begin + trim, end - begin - 2 * trim);
-                begin = end + 1;
+            for (unsigned j = 0; j < N; j++) {
+                const unsigned encoded = field_ends[i + j], last = encoded & (quoted - 1),
+                               trim = encoded >> 15;
+                fields[j] = Text(batch.data() + begin + trim, last - begin - 2 * trim);
+                begin = last + 1;
             }
-            consume(fields);
-        }
+            if constexpr (std::is_base_of_v<ReceivingEventShapes, F>)
+                consume(fields, shape);
+            else
+                consume(fields);
+        };
+        if constexpr (N == 7 && std::is_base_of_v<ReceivingEventShapes, F>) {
+            // The two validated field widths distinguish the two ISO clock
+            // lengths and separate the possible purchase rows before decoding.
+            std::array<std::array<std::uint16_t, max_bytes / 7 + 1>, 6> rows;
+            std::array<unsigned, 6> counts{};
+            for (unsigned i = 0; i < field_count; i += 7) {
+                auto width = [&](unsigned field) {
+                    auto x = field_ends[i + field];
+                    return (x & (quoted - 1)) - (field_ends[i + field - 1] & (quoted - 1)) - 1 -
+                           2 * (x >> 15);
+                };
+                auto time = width(2), kind = width(4);
+                unsigned shape = (time == 20 ? 0 : time == 25 ? 1 : 2) + 3 * (kind == 8);
+                rows[shape][counts[shape]++] = i;
+            }
+            auto grouped = [&](auto tag) {
+                constexpr unsigned shape = decltype(tag)::value;
+                for (unsigned k = 0; k < counts[shape]; k++)
+                    dispatch(rows[shape][k], tag);
+            };
+            grouped(std::integral_constant<int, 0>{});
+            grouped(std::integral_constant<int, 1>{});
+            grouped(std::integral_constant<int, 2>{});
+            grouped(std::integral_constant<int, 3>{});
+            grouped(std::integral_constant<int, 4>{});
+            grouped(std::integral_constant<int, 5>{});
+        } else
+            for (unsigned i = 0; i < field_count; i += N)
+                dispatch(i, std::integral_constant<int, -1>{});
     }
 }
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))

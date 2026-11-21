@@ -64,6 +64,10 @@ The CSV scanner validates batches of complete rows and indexes their field bound
 
 On the Apple M4, alternating ten warm measured runs per build on seed 76129 (10M events, 2.5M clicks) gave medians of 0.8822 s for `3e79282` and 0.8252 s for this pipeline. CPU time fell from 3.3992 s to 3.2198 s. All rows matched. A sanitizer build matched an independent CSV decoder on 210,000 generated lines across the link, click and event schemas, including malformed rows, vector boundaries and unterminated final lines.
 
+File mapping uses up to `NCPU` workers and requests kernel readahead in 2 MiB ranges. After validating an event batch, the parser groups rows by the decoded widths of `ts` and `event_type`. The validator checks the timestamp syntax and event type for every row. The user Parquet table uses delta byte-array encoding for `user_id` and dictionary encoding for several repeated columns.
+
+At eight workers on the 10M-event seed 76129, ten warm alternating measurements on an Apple M4 gave medians of 0.5992 s for `39b5ea5` and 0.5857 s for this version. CPU time changed from 2.8955 s to 2.8729 s. Both complete tables matched. Their combined Parquet size fell from 45,940,521 to 9,635,963 bytes. The pipeline also matched the 36 fixtures, the organizer’s million-event answers, and independent wide-window and hash-collision tests. Six copies of the same ten-million-event input produced the same deduplicated tables at the final event volume, with peak RSS of 8.69 GiB.
+
 Generate the larger workload after `make check-dev`.
 
 ```sh

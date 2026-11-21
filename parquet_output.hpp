@@ -21,7 +21,13 @@ inline std::unique_ptr<pq::ParquetFileWriter> parquet_file(const fs::path& path,
     auto schema = std::static_pointer_cast<pq::schema::GroupNode>(
         pq::schema::GroupNode::Make("schema", pq::Repetition::REQUIRED, columns));
     pq::WriterProperties::Builder options;
-    options.disable_dictionary()->disable_statistics();
+    // Grouped user names share prefixes. Low-cardinality measures use dictionaries.
+    options.disable_statistics();
+    options.disable_dictionary();
+    for (auto name : {"sessions", "events", "top_category", "day", "channel"})
+        options.enable_dictionary(name);
+    options.encoding("user_id", pq::Encoding::DELTA_BYTE_ARRAY);
+    options.enable_dictionary("revenue_cents");
     return pq::ParquetFileWriter::Open(*result, std::move(schema), options.build());
 }
 
