@@ -11,10 +11,20 @@
 // and all other unrepresentable names retain a view of their original bytes.
 struct Name {
     static constexpr std::uint64_t external = UINT64_C(1) << 63;
+    static constexpr std::uint64_t cached_flag = 1;
+    static constexpr std::size_t cached_length = 33;
+    struct CachedName { const char* data; std::size_t hash; };
+    static_assert(alignof(CachedName) >= 2 && alignof(Text) >= 2);
     std::uint64_t value = external;
 
     bool empty() const { return value == external; }
-    const Text& reference() const { return *reinterpret_cast<const Text*>(value & ~external); }
+    const CachedName& cached_name() const {
+        return *reinterpret_cast<const CachedName*>(value & ~(external | cached_flag));
+    }
+    Text reference() const {
+        if (value & cached_flag) return {cached_name().data, cached_length};
+        return *reinterpret_cast<const Text*>(value & ~external);
+    }
     bool operator==(Name b) const {
         if (value == b.value) return true;
         return (value & b.value & external) && !empty() && !b.empty() && reference() == b.reference();
@@ -44,7 +54,8 @@ struct Name {
         return view(a) > other.view(b);
     }
     std::size_t hash() const {
-        if (value & external) return std::hash<Text>{}(reference());
+        if (value & external)
+            return value & cached_flag ? cached_name().hash : std::hash<Text>{}(reference());
         const auto mixed = value * UINT64_C(0x9e3779b97f4a7c15);
         return mixed ^ (mixed >> 32);
     }
@@ -54,6 +65,7 @@ struct NameHash { std::size_t operator()(Name name) const { return name.hash(); 
 
 struct NamePool {
     std::deque<Text> external_names;
+    std::deque<Name::CachedName> cached_names;
     Name get(Text text) {
         if (text.size() == 9 || text.size() == 8) {
             static constexpr auto prefixes = [] {
@@ -72,6 +84,12 @@ struct NamePool {
 #endif
             if (!(bytes & ~Name::ascii) && first < 128 && (first || !has_prefix))
                 return {bytes | prefixes[first]};
+        }
+        // At this frequent width the length fits in the representation tag. Keep
+        // the full hash in the space normally used by the string view's length.
+        if (text.size() == Name::cached_length) {
+            cached_names.push_back({text.data(), std::hash<Text>{}(text)});
+            return {Name::external | Name::cached_flag | reinterpret_cast<std::uintptr_t>(&cached_names.back())};
         }
         external_names.push_back(text);
         return {Name::external | reinterpret_cast<std::uintptr_t>(&external_names.back())};
