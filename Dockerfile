@@ -5,10 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /
 WORKDIR /src
 COPY sessions.cpp input.hpp identity.hpp parquet_output.hpp build.py ./
 RUN python build.py && mkdir /src/bin && mv sessions /src/bin/sessions
-COPY cpu_dispatch.c ./
+COPY cpu_dispatch.c training.py ./
 RUN if [ "$(uname -m)" = "x86_64" ]; then \
         mv /src/bin/sessions /src/bin/sessions-generic && \
-        CXXFLAGS="-O3 -march=x86-64-v3 -mtune=haswell -flto" python build.py && \
+        CXXFLAGS="-O3 -march=x86-64-v3 -mtune=haswell -flto" python build.py --train-v3 && \
         mv sessions /src/bin/sessions-v3 && \
         cc -std=c11 -O2 -static -s cpu_dispatch.c -o /src/bin/sessions; \
     fi

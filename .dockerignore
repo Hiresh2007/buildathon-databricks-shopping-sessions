@@ -8,3 +8,4 @@
 !identity.hpp
 !parquet_output.hpp
 !build.py
+!training.py
