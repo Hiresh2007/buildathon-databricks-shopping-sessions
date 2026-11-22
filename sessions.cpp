@@ -127,14 +127,22 @@ struct ConnectedAliases {
 };
 
 struct People {
-    struct Entry { Name name, owner; };
+    // The partition for a linked identity only needs to be computed once per canonical mapping.
+    struct Route {
+        Name person;
+        std::size_t shard;
+    };
+    struct Entry {
+        Name name;
+        Route owner;
+    };
     std::vector<Entry> entries;
     std::vector<std::uint64_t> membership;
     std::vector<NamePool> storage;
 
-    std::size_t slot(Name name) const {
+    std::size_t slot(Name name, std::size_t hash) const {
         const auto mask = entries.size() - 1;
-        auto i = name.hash() & mask;
+        auto i = hash & mask;
         while (!entries[i].name.empty() && entries[i].name != name) i = (i + 1) & mask;
         return i;
     }
@@ -149,19 +157,22 @@ struct People {
         for (auto& reader : links.readers) {
             for (int child : reader.children) {
                 auto name = links.name(child);
-                entries[slot(name)] = {name, links.name(links.root(child))};
                 auto h = name.hash();
+                auto owner = links.name(links.root(child));
+                entries[slot(name, h)] = {name, {owner, owner.hash() % shards}};
                 membership[(h >> 6) & (membership.size() - 1)] |= UINT64_C(1) << (h & 63);
             }
             storage.push_back(std::move(reader.names));
         }
     }
 
-    Name find(Name name) const {
-        auto h = name.hash();
-        if (!(membership[(h >> 6) & (membership.size() - 1)] & (UINT64_C(1) << (h & 63)))) return name;
-        const auto& e = entries[slot(name)];
-        return e.name.empty() ? name : e.owner;
+    Route find(Name name) const {
+        const auto hash = name.hash();
+        const Route original{name, hash % shards};
+        if (!(membership[(hash >> 6) & (membership.size() - 1)] & (UINT64_C(1) << (hash & 63))))
+            return original;
+        const auto &entry = entries[slot(name, hash)];
+        return entry.name.empty() ? original : entry.owner;
     }
 };
 
@@ -364,7 +375,7 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
         // Field widths were verified from this row's delimiter and quote masks.
         auto direct = [&](const char *row, const auto &shape) {
             auto ptr = [&](unsigned i) { return row + shape.begin[i]; };
-            auto id = ids[t].get(Text(ptr(0), 9));
+            auto id = ids[t].get(Text(ptr(0), shape.length[0]));
             auto hash = id.hash();
             auto ingest = ptr(3);
             auto arrival_day = midnight(ingest);
@@ -410,7 +421,8 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
                 emit({});
                 return;
             }
-            emit({names[t].get(Text(ptr(1), 9)), values.time(ts, t), values.purchase(price, category, t)});
+            emit({names[t].get(Text(ptr(1), shape.length[1])), values.time(ts, t),
+                  values.purchase(price, category, t)});
         };
         FixedWidthRows<7, decltype(general), decltype(direct)> receiver(general, direct);
         records<7>(files.chunks[j - links.chunks.size()], receiver);
@@ -441,8 +453,9 @@ void load_events(const Files& files, const Files& links, std::optional<People>& 
         std::vector<Version*> slots(capacity);
         auto emit = [&](Event event) {
             if (!event.person.empty()) {
-                event.person = people->find(event.person);
-                out.add(t, event.person.hash(), event);
+                const auto route = people->find(event.person);
+                event.person = route.person;
+                out.add(t, route.shard, event);
             }
         };
         for (auto& worker : versions.local) for (auto& row : worker[shard]) {
@@ -479,7 +492,7 @@ void load_clicks(const Files& files, const People& people, const Catalog& catalo
             if (campaign < 0)
                 return;
             auto person = people.find(names[t].get(f[1]));
-            out.add(t, person.hash(), {person, names[t].get(f[0]), values.time(ts, t), campaign});
+            out.add(t, person.shard, {person.person, names[t].get(f[0]), values.time(ts, t), campaign});
         };
         // Field widths were verified from this row's delimiter and quote masks.
         auto direct = [&](const char *row, const auto &shape) {
@@ -497,7 +510,7 @@ void load_clicks(const Files& files, const People& people, const Catalog& catalo
                 return shape.length[i] == 9 ? names[t].get(Text(ptr(i), 9)) : names[t].get(Text(ptr(i), 8));
             };
             auto person = people.find(name(1));
-            out.add(t, person.hash(), {person, name(0), values.time(ts, t), campaign});
+            out.add(t, person.shard, {person.person, name(0), values.time(ts, t), campaign});
         };
         FixedWidthRows<4, decltype(general), decltype(direct)> receiver(general, direct);
         records<4>(files.chunks[j], receiver);

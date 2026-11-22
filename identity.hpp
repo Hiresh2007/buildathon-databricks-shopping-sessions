@@ -2,19 +2,31 @@
 
 #include "input.hpp"
 #include <cstring>
-#include <deque>
 #include <functional>
+#include <memory>
+
+// The hash accompanies the original source view for variable-width IDs. Equality always checks the bytes.
+struct StoredName {
+    Text text;
+    std::size_t hash;
+};
 
 // Eight ASCII bytes occupy the low seven bits of each byte in a word. For
 // nine-byte names, the leading character occupies the seven spare high bits.
 // A zero prefix denotes an eight-byte name; nine-byte names beginning with NUL
 // and all other unrepresentable names retain a view of their original bytes.
+
 struct Name {
     static constexpr std::uint64_t external = UINT64_C(1) << 63;
     std::uint64_t value = external;
 
     bool empty() const { return value == external; }
-    const Text& reference() const { return *reinterpret_cast<const Text*>(value & ~external); }
+    const StoredName &stored() const {
+        return *reinterpret_cast<const StoredName *>(value & ~external);
+    }
+    Text reference() const {
+        return stored().text;
+    }
     bool operator==(Name b) const {
         if (value == b.value) return true;
         return (value & b.value & external) && !empty() && !b.empty() && reference() == b.reference();
@@ -44,7 +56,8 @@ struct Name {
         return view(a) > other.view(b);
     }
     std::size_t hash() const {
-        if (value & external) return std::hash<Text>{}(reference());
+        if (value & external)
+            return stored().hash;
         const auto mixed = value * UINT64_C(0x9e3779b97f4a7c15);
         return mixed ^ (mixed >> 32);
     }
@@ -53,12 +66,24 @@ struct Name {
 struct NameHash { std::size_t operator()(Name name) const { return name.hash(); } };
 
 struct NamePool {
-    std::deque<Text> external_names;
-    __attribute__((noinline)) Name store_external(Text text) {
-        external_names.push_back(text);
-        return {Name::external | reinterpret_cast<std::uintptr_t>(&external_names.back())};
+    // A Name can outlive this pool's original owner after the aliases have been joined.
+    // Moving a block handle preserves all pointers into the block.
+    std::vector<std::unique_ptr<StoredName[]>> blocks;
+    StoredName *next = nullptr;
+    StoredName *limit = nullptr;
+    __attribute__((noinline)) void add_block() {
+        constexpr unsigned capacity = 512;
+        blocks.push_back(std::make_unique<StoredName[]>(capacity));
+        next = blocks.back().get();
+        limit = next + capacity;
     }
-
+    Name store_external(Text text) {
+        if (next == limit)
+            add_block();
+        auto *value = next++;
+        *value = {text, std::hash<Text>{}(text)};
+        return {Name::external | reinterpret_cast<std::uintptr_t>(value)};
+    }
     Name get(Text text) {
         if (text.size() == 9 || text.size() == 8) {
             static constexpr auto prefixes = [] {

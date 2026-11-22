@@ -374,8 +374,7 @@ __attribute__((always_inline)) inline void cached_records(Text bytes, F &emit) {
                         (entry.length[3] == 13 || entry.length[3] == 20 || entry.length[3] == 25);
                 if constexpr (N == 7 && std::is_base_of_v<FixedWidthRowTag<7>, F>)
                     entry.fixed_width =
-                        entry.valid_layout && entry.length[0] == 9 && entry.length[1] == 9 &&
-                        entry.length[3] == 20 &&
+                        entry.valid_layout && entry.length[0] && entry.length[1] && entry.length[3] == 20 &&
                         (entry.length[2] == 20 || entry.length[2] == 25 || entry.length[2] == 13) &&
                         (entry.length[4] == 4 || entry.length[4] == 8);
             }
