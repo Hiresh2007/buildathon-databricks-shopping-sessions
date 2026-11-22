@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -8,6 +9,8 @@
 #include <fcntl.h>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
+#include <thread>
 #include <type_traits>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -61,12 +64,12 @@ struct Files {
         constexpr static std::size_t size = 1u << 21;
         // Each worker owns the records that begin in its fixed byte range.
         // The mapping starts at a page boundary, while the first CSV record can start later.
-        void prefetch() const {
+        int advise(int advice) const {
             const auto end = std::min(data.size(), offset + size);
             auto base = reinterpret_cast<std::uintptr_t>(data.data() + offset);
             static const auto page = static_cast<std::uintptr_t>(::sysconf(_SC_PAGESIZE));
             auto first = base & ~(page - 1);
-            ::madvise(reinterpret_cast<void *>(first), base - first + end - offset, MADV_WILLNEED);
+            return ::madvise(reinterpret_cast<void *>(first), base - first + end - offset, advice);
         }
         // Skip the header in the first range or a partial row at any later range.
         // Only the owner of a long row searches past its range for the terminating newline.
@@ -95,11 +98,11 @@ struct Files {
     Text largest_file;
     void prefetch(std::size_t index) const {
         if (index < chunks.size())
-            chunks[index].prefetch();
+            chunks[index].advise(MADV_WILLNEED);
     }
     void start_prefetch(std::size_t n) const {
         for (std::size_t i = 0; i < std::min(n, chunks.size()); ++i)
-            chunks[i].prefetch();
+            chunks[i].advise(MADV_WILLNEED);
     }
     std::size_t estimated_rows() const {
         auto sample = largest_file.substr(0, 8192);
@@ -124,6 +127,40 @@ struct Files {
             for (std::size_t offset = 0; offset < data.size(); offset += Chunk::size)
                 chunks.push_back({data, offset});
         }
+    }
+};
+
+// Bring file-backed pages into this process while workers decode earlier records.
+// Each claimed range belongs to one reader. A failed advisory call leaves normal demand paging available.
+class FilePrefetch {
+    std::vector<std::thread> readers;
+    std::atomic<std::size_t> next{0};
+    std::atomic<bool> finished{false};
+
+public:
+    FilePrefetch(const Files& input, std::size_t count) {
+#if defined(__linux__) && defined(MADV_POPULATE_READ)
+        count = std::min(count, input.chunks.size());
+        readers.reserve(count);
+        for (std::size_t i = 0; i < count; ++i) {
+            try {
+                readers.emplace_back([this, &input] {
+                    while (!finished.load(std::memory_order_relaxed)) {
+                        const auto index = next.fetch_add(1, std::memory_order_relaxed);
+                        if (index >= input.chunks.size() || input.chunks[index].advise(MADV_POPULATE_READ) != 0)
+                            return;
+                    }
+                });
+            } catch (const std::system_error&) {
+                break;
+            }
+        }
+#endif
+    }
+
+    ~FilePrefetch() {
+        finished.store(true, std::memory_order_relaxed);
+        for (auto& reader : readers) reader.join();
     }
 };
 

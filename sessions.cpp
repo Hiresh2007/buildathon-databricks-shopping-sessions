@@ -868,6 +868,7 @@ int main(int argc, char** argv) {
         Files event_files(data / "events"), click_files(data / "clicks");
         std::optional<People> people;
         Catalog catalog(products, campaigns);
+        FilePrefetch event_pages(event_files, 2), click_pages(click_files, 1);
         PackedValues values(start, end, catalog.categories.size());
         Partition<Event> events;
         Partition<Click> clicks;
